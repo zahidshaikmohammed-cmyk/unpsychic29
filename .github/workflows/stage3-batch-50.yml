@@ -1,0 +1,118 @@
+name: UNPSYCHIC29 Stage 3 - 50 Stock Batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_number:
+        description: "Batch number (1-10)"
+        required: true
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    name: Batch ${{ inputs.batch_number }}/10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout acquisition implementation
+        uses: actions/checkout@v6
+        with:
+          ref: data-acquisition
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Deterministic preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+          python src/dhan_historical.py --self-test
+          python src/stage3_acquire.py --self-test
+
+      - name: Build and verify NIFTY 500 universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/build_universe.py --output artifacts/universe
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/universe")
+          manifest = json.loads((root / "universe_manifest.json").read_text())
+          universe = pd.read_csv(root / "candidate_universe.csv")
+          if manifest["constituent_count"] != 500 or manifest["resolved_count"] != 500 or len(universe) != 500:
+              raise SystemExit("NIFTY 500 universe gate failed")
+          if not universe["symbol"].is_unique or not universe["security_id"].is_unique:
+              raise SystemExit("Universe uniqueness gate failed")
+          print("Universe gate: PASS | 500 stocks")
+          PY
+
+      - name: Acquire exactly one 50-stock batch
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BATCH="${{ inputs.batch_number }}"
+          case "$BATCH" in 1|2|3|4|5|6|7|8|9|10) ;; *) echo "batch_number must be 1-10"; exit 1;; esac
+          mkdir -p artifacts/stage3
+          python src/stage3_acquire.py \
+            --universe artifacts/universe/candidate_universe.csv \
+            --batch-number "$BATCH" \
+            --batch-size 50 \
+            --lookback-days 365 \
+            --chunk-days 30 \
+            --output artifacts/stage3 2>&1 | tee artifacts/stage3/acquisition.log
+
+      - name: Final 50-stock integrity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/stage3")
+          manifest = json.loads((root / "stage3_manifest.json").read_text())
+          batch = pd.read_csv(root / "batch_universe.csv")
+          validation = pd.read_csv(root / "download_validation.csv")
+          acquisition = pd.read_csv(root / "acquisition_quality.csv")
+          daily = pd.read_parquet(root / "daily_features.parquet")
+          if len(batch) != 50 or batch["symbol"].nunique() != 50:
+              raise SystemExit("Batch must contain exactly 50 unique stocks")
+          if len(validation) != 50 or not (validation["status"] == "OK").all():
+              raise SystemExit("Validation gate failed")
+          if len(acquisition) != 50 or not (acquisition["acquisition_status"] == "ACQUIRED").all():
+              raise SystemExit("Acquisition gate failed")
+          if daily["symbol"].nunique() != 50:
+              raise SystemExit("Daily feature coverage gate failed")
+          if manifest["batch_symbol_count"] != 50 or manifest["validated_symbol_count"] != 50:
+              raise SystemExit("Manifest gate failed")
+          print(f"BATCH {manifest['batch_number']}: PASS | 50/50 stocks | {len(daily)} daily rows")
+          PY
+
+      - name: Upload validated 50-stock artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage3-batch-${{ inputs.batch_number }}
+          path: artifacts/stage3/
+          retention-days: 14

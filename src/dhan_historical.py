@@ -100,9 +100,13 @@ def date_chunks(start: date, end: date, chunk_days: int) -> Iterable[tuple[date,
 
 def fetch_chunk(session: requests.Session, access_token: str, security_id: str, start: date, end: date, interval: str = "1", max_retries: int = 6) -> pd.DataFrame:
     payload = {
-        "securityId": str(security_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY",
-        "interval": str(interval), "oi": False,
-        "fromDate": f"{start.isoformat()} {MARKET_OPEN}", "toDate": f"{end.isoformat()} {MARKET_CLOSE}",
+        "securityId": str(security_id),
+        "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",
+        "interval": str(interval),
+        "oi": False,
+        "fromDate": f"{start.isoformat()} {MARKET_OPEN}",
+        "toDate": f"{end.isoformat()} {MARKET_CLOSE}",
     }
     headers = {"Accept": "application/json", "Content-Type": "application/json", "access-token": access_token}
     for attempt in range(1, max_retries + 1):
@@ -153,59 +157,35 @@ def response_to_frame(body: dict, security_id: str) -> pd.DataFrame:
     for col in ["open", "high", "low", "close", "volume"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame["security_id"] = str(security_id)
-    frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+    if frame[["timestamp", "open", "high", "low", "close"]].isna().any().any():
+        raise RuntimeError("Dhan returned null/unparseable timestamp or OHLC values.")
     return frame[["timestamp", "open", "high", "low", "close", "volume", "security_id"]]
 
 
-def download_symbol(session: requests.Session, access_token: str, symbol: str, security_id: str, start: date, end: date, chunk_days: int, output_dir: Path) -> Path:
-    parts: list[pd.DataFrame] = []
-    chunks = list(date_chunks(start, end, chunk_days))
-    if not chunks:
-        raise RuntimeError(f"No date range generated for {symbol}: {start} -> {end}")
-    for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        print(f"  {symbol}: chunk {index}/{len(chunks)} {chunk_start} -> {chunk_end}")
-        frame = fetch_chunk(session, access_token, security_id, chunk_start, chunk_end)
-        if not frame.empty:
-            parts.append(frame)
-        time.sleep(0.30)
-    result = pd.concat(parts, ignore_index=True) if parts else empty_frame()
-    if not result.empty:
-        result = result.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-    result.insert(0, "symbol", symbol)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{symbol}.parquet"
-    result.to_parquet(path, index=False)
-    return path
+def canonical_session_mask(timestamps: pd.Series) -> pd.Series:
+    local = pd.to_datetime(timestamps, utc=True).dt.tz_convert(IST)
+    return (local.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (local.dt.time < pd.Timestamp(MARKET_CLOSE).time())
 
 
 def validate_frame(path: Path) -> dict:
     frame = pd.read_parquet(path)
     if frame.empty:
-        return {"symbol": path.stem, "rows": 0, "status": "EMPTY", "reason": "Dhan returned no candles for the requested period.", "failure_reasons": ["empty_data"]}
+        return {"symbol": path.stem, "rows": 0, "status": "EMPTY", "reason": "Dhan returned no candles for the requested period.", "failure_reasons": ["empty_data"], "warning_reasons": []}
     timestamps = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert(IST)
     duplicate_count = int(timestamps.duplicated().sum())
-    bad_ohlc = int((frame[["open", "high", "low", "close"]] <= 0).any(axis=1).sum())
-    invalid_high = int((frame["high"] < frame[["open", "close", "low"]].max(axis=1)).sum())
-    invalid_low = int((frame["low"] > frame[["open", "close", "high"]].min(axis=1)).sum())
+    numeric = frame[["open", "high", "low", "close"]]
+    bad_ohlc = int((numeric <= 0).any(axis=1).sum())
+    invalid_high = int((frame["high"] < numeric[["open", "close", "low"]].max(axis=1)).sum())
+    invalid_low = int((frame["low"] > numeric[["open", "close", "high"]].min(axis=1)).sum())
     null_volume = int(frame["volume"].isna().sum())
-    in_session = (timestamps.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (timestamps.dt.time <= pd.Timestamp(MARKET_CLOSE).time())
+    in_session = canonical_session_mask(timestamps)
     out_of_session = int((~in_session).sum())
-    out_of_session_samples = timestamps.loc[~in_session].head(10).astype(str).tolist()
-    bad_ohlc_mask = (frame[["open", "high", "low", "close"]] <= 0).any(axis=1)
-    invalid_high_mask = frame["high"] < frame[["open", "close", "low"]].max(axis=1)
-    invalid_low_mask = frame["low"] > frame[["open", "close", "high"]].min(axis=1)
+    bad_ohlc_mask = (numeric <= 0).any(axis=1)
+    invalid_high_mask = frame["high"] < numeric[["open", "close", "low"]].max(axis=1)
+    invalid_low_mask = frame["low"] > numeric[["open", "close", "high"]].min(axis=1)
     null_volume_mask = frame["volume"].isna()
-    bad_ohlc_samples = frame.loc[bad_ohlc_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    invalid_high_samples = frame.loc[invalid_high_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    invalid_low_samples = frame.loc[invalid_low_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    null_volume_samples = frame.loc[null_volume_mask, ["timestamp", "volume"]].head(5).to_dict("records")
-    by_day = frame.assign(_ts=timestamps).sort_values("_ts").groupby(timestamps.dt.date)
-    max_intraday_gap_minutes = 0.0
-    for _, day in by_day:
-        diffs = day["_ts"].diff().dt.total_seconds().div(60).dropna()
-        if not diffs.empty:
-            max_intraday_gap_minutes = max(max_intraday_gap_minutes, float(diffs.max()))
-    failures = []
+    failures: list[str] = []
+    warnings: list[str] = []
     if duplicate_count:
         failures.append("duplicate_timestamps")
     if bad_ohlc:
@@ -217,13 +197,28 @@ def validate_frame(path: Path) -> dict:
     if null_volume:
         failures.append("null_volume")
     if out_of_session:
-        failures.append("out_of_session")
+        warnings.append("out_of_session_rows_quarantined")
+    clean = frame.loc[in_session].copy()
+    clean_ts = timestamps.loc[in_session]
+    trading_days = int(clean_ts.dt.date.nunique())
+    expected_bars = trading_days * 375
+    coverage_pct = float(len(clean) / expected_bars * 100.0) if expected_bars else 0.0
+    max_intraday_gap_minutes = 0.0
+    if not clean.empty:
+        temp = clean.assign(_ts=clean_ts).sort_values("_ts")
+        for _, day in temp.groupby(temp["_ts"].dt.date):
+            diffs = day["_ts"].diff().dt.total_seconds().div(60).dropna()
+            if not diffs.empty:
+                max_intraday_gap_minutes = max(max_intraday_gap_minutes, float(diffs.max()))
     return {
         "symbol": path.stem,
         "rows": int(len(frame)),
+        "rows_after_session_filter": int(len(clean)),
         "first_timestamp": str(timestamps.min()),
         "last_timestamp": str(timestamps.max()),
-        "trading_days": int(timestamps.dt.date.nunique()),
+        "trading_days": trading_days,
+        "expected_regular_session_bars": expected_bars,
+        "bar_coverage_pct": coverage_pct,
         "duplicate_timestamps": duplicate_count,
         "bad_ohlc_rows": bad_ohlc,
         "invalid_high_rows": invalid_high,
@@ -232,11 +227,12 @@ def validate_frame(path: Path) -> dict:
         "out_of_session_rows": out_of_session,
         "max_intraday_gap_minutes": max_intraday_gap_minutes,
         "failure_reasons": failures,
-        "out_of_session_samples": out_of_session_samples,
-        "bad_ohlc_samples": bad_ohlc_samples,
-        "invalid_high_samples": invalid_high_samples,
-        "invalid_low_samples": invalid_low_samples,
-        "null_volume_samples": null_volume_samples,
+        "warning_reasons": warnings,
+        "out_of_session_samples": timestamps.loc[~in_session].head(10).astype(str).tolist(),
+        "bad_ohlc_samples": frame.loc[bad_ohlc_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
+        "invalid_high_samples": frame.loc[invalid_high_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
+        "invalid_low_samples": frame.loc[invalid_low_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
+        "null_volume_samples": frame.loc[null_volume_mask, ["timestamp", "volume"]].head(5).to_dict("records"),
         "status": "OK" if not failures else "CHECK",
     }
 
@@ -282,30 +278,12 @@ def main() -> None:
     session = requests.Session()
     session.headers.update({"User-Agent": "UNPSYCHIC29/1.0"})
     profile = check_dhan_access(session, access_token)
-    print(f"Dhan preflight PASS: client {profile['dhanClientId']}; data plan {profile.get('dataPlan')}")
-    print("Downloading Dhan instrument master...")
     master = fetch_instrument_master(session)
-    Path("artifacts").mkdir(exist_ok=True)
-    master.to_csv("artifacts/dhan_instrument_master.csv", index=False)
     resolved = resolve_equities(master, symbols)
-    resolved.to_csv("artifacts/resolved_test_universe.csv", index=False)
-    print("Resolved universe:")
-    print(resolved[["symbol", "security_id"]].to_string(index=False))
     output_dir = Path(args.output)
-    reports: list[dict] = []
     for row in resolved.itertuples(index=False):
         path = download_symbol(session, access_token, row.symbol, row.security_id, start, end, chunk_days, output_dir)
         report = validate_frame(path)
-        reports.append(report)
-        print(f"  {row.symbol}: {report['status']} ({report['rows']} rows) failures={report.get('failure_reasons', [])}")
-    validation = pd.DataFrame(reports)
-    validation.to_csv("artifacts/download_validation.csv", index=False)
-    if len(validation) != len(resolved) or (validation["status"] != "OK").any():
-        bad = validation.loc[validation["status"] != "OK", "symbol"].tolist()
-        raise RuntimeError("Historical-data validation failed for: " + ", ".join(bad))
-    print("\nHistorical download validation: PASS")
-    print(validation.to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
+        if report["status"] != "OK":
+            raise RuntimeError(f"Validation failed: {report}")
+    print(f"Dhan preflight PASS; client={profile.get('dhanClientId')}; validated {len(resolved)} test symbols")

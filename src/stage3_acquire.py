@@ -101,6 +101,14 @@ def acquire_symbol(session: requests.Session, token: str, symbol: str, security_
     return raw, chunk_reports, duplicates, anomalies, anomaly_timestamps
 
 
+def write_raw_frame(frame: pd.DataFrame, symbol: str, raw_dir: Path) -> Path:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    safe_symbol = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in symbol)
+    path = raw_dir / f"{safe_symbol}.parquet"
+    frame.to_parquet(path, index=False, compression="zstd")
+    return path
+
+
 def write_temp_frame(frame: pd.DataFrame, symbol: str) -> Path:
     path = Path("/tmp") / f"unpsychic29_{symbol}.parquet"
     frame.to_parquet(path, index=False)
@@ -119,6 +127,7 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
     end = datetime.now(IST).date() + timedelta(days=1)
     start = end - timedelta(days=lookback_days)
     output_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_dir / "raw_1min"
     daily_parts, validations, chunks, acquisition_rows = [], [], [], []
     print(f"Stage 3 batch {batch_number}: {len(batch)} symbols; {start} -> {end} exclusive")
     print(f"Dhan profile preflight: PASS; client={profile.get('dhanClientId')}; dataPlan={profile.get('dataPlan')}")
@@ -127,6 +136,7 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
         print(f"\n[{row.symbol}] securityId={row.security_id}")
         raw, symbol_chunks, duplicates, anomalies, anomaly_timestamps = acquire_symbol(session, token, row.symbol, row.security_id, start, end, chunk_days)
         chunks.extend(symbol_chunks)
+        raw_path = write_raw_frame(raw, row.symbol, raw_dir)
         temp = write_temp_frame(raw, row.symbol)
         try:
             report = validate_frame(temp)
@@ -137,6 +147,7 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
         report["provider_ohlc_anomaly_samples"] = anomaly_timestamps[:10]
         validations.append(report)
         if report["status"] != "OK":
+            raw_path.unlink(missing_ok=True)
             raise RuntimeError(f"Structural validation failed for {row.symbol}: {json.dumps(report, default=str)}")
         clean = raw.loc[canonical_session_mask(raw["timestamp"])].sort_values("timestamp").reset_index(drop=True)
         features = daily_features(clean)
@@ -153,13 +164,15 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
             "max_intraday_gap_minutes": float(report["max_intraday_gap_minutes"]),
             "feature_days_with_complete_opening10": feature_days,
             "feature_status": "AVAILABLE" if feature_days else "NO_COMPLETE_OPENING_DAYS",
+            "raw_1min_file": str(raw_path.relative_to(output_dir)),
             "warning_reasons": ";".join(warning_reasons),
         })
         if features.empty:
+            raw_path.unlink(missing_ok=True)
             raise RuntimeError(f"No daily behavioural features were produced for {row.symbol}.")
         features["batch_number"] = batch_number
         daily_parts.append(features)
-        print(f"{row.symbol}: PASS | {report['rows']} candles | {report['trading_days']} days | {report['bar_coverage_pct']:.2f}% coverage | {feature_days} feature days")
+        print(f"{row.symbol}: PASS | {report['rows']} candles | {report['trading_days']} days | {report['bar_coverage_pct']:.2f}% coverage | {feature_days} feature days | raw persisted")
 
     validation = pd.DataFrame(validations).sort_values("symbol")
     acquisition = pd.DataFrame(acquisition_rows).sort_values("symbol")
@@ -167,6 +180,9 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
     chunk_log = pd.DataFrame(chunks)
     if len(validation) != len(batch) or len(acquisition) != len(batch) or not (validation["status"] == "OK").all():
         raise RuntimeError("Batch integrity gate failed.")
+    raw_files = sorted(raw_dir.glob("*.parquet"))
+    if len(raw_files) != len(batch):
+        raise RuntimeError(f"Raw 1-minute persistence gate failed: expected {len(batch)} files, found {len(raw_files)}.")
     batch.to_csv(output_dir / "batch_universe.csv", index=False)
     validation.to_csv(output_dir / "download_validation.csv", index=False)
     acquisition.to_csv(output_dir / "acquisition_quality.csv", index=False)
@@ -178,7 +194,8 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
         "generated_at_utc": datetime.now(ZoneInfo("UTC")).isoformat(), "batch_number": batch_number,
         "batch_size_requested": batch_size, "batch_symbol_count": len(batch), "universe_symbol_count": len(universe),
         "lookback_calendar_days": lookback_days, "from_date": start.isoformat(), "to_date_exclusive": end.isoformat(),
-        "chunk_days": chunk_days, "raw_1min_data_persisted": False, "raw_1min_data_processed_in_memory": True,
+        "chunk_days": chunk_days, "raw_1min_data_persisted": True, "raw_1min_data_processed_in_memory": True,
+        "raw_1min_files": len(raw_files), "raw_1min_format": "parquet-zstd-per-symbol",
         "all_symbols_acquired": True, "validated_symbol_count": len(validation),
         "symbols_with_complete_opening10_features": int((acquisition["feature_status"] == "AVAILABLE").sum()),
         "provider_ohlc_anomalies_quarantined_total": int(acquisition["provider_ohlc_anomalies_quarantined"].sum()),

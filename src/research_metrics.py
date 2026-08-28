@@ -7,11 +7,23 @@ import pandas as pd
 
 IST = "Asia/Kolkata"
 MARKET_OPEN_MINUTE = 9 * 60 + 15
-MARKET_CLOSE_MINUTE = 15 * 60 + 30
+MARKET_CLOSE_MINUTE_EXCLUSIVE = 15 * 60 + 30
+EXPECTED_BARS_PER_SESSION = 375
 
 
-def first_n_minutes(day: pd.DataFrame, minutes: int = 10) -> pd.DataFrame:
-    return day.sort_values("timestamp").head(minutes)
+def session_filter(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert(IST)
+    minute = frame["timestamp"].dt.hour * 60 + frame["timestamp"].dt.minute
+    return frame[(minute >= MARKET_OPEN_MINUTE) & (minute < MARKET_CLOSE_MINUTE_EXCLUSIVE)].copy()
+
+
+def opening_window(day: pd.DataFrame, minutes: int = 10) -> pd.DataFrame:
+    day = day.sort_values("timestamp")
+    start = day["timestamp"].dt.normalize().iloc[0] + pd.Timedelta(minutes=MARKET_OPEN_MINUTE)
+    expected = pd.date_range(start=start, periods=minutes, freq="min", tz=IST)
+    indexed = day.set_index("timestamp")
+    return indexed.reindex(expected).reset_index(names="timestamp")
 
 
 def daily_features(frame: pd.DataFrame) -> pd.DataFrame:
@@ -22,24 +34,29 @@ def daily_features(frame: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise RuntimeError(f"Research input is missing columns: {sorted(missing)}")
 
-    frame = frame.copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert(IST)
+    frame = session_filter(frame)
+    if frame.empty:
+        return pd.DataFrame()
     frame["trade_date"] = frame["timestamp"].dt.date
-    frame["minute_of_day"] = frame["timestamp"].dt.hour * 60 + frame["timestamp"].dt.minute
-    frame = frame[(frame["minute_of_day"] >= MARKET_OPEN_MINUTE) & (frame["minute_of_day"] <= MARKET_CLOSE_MINUTE)]
 
     rows = []
     for symbol, symbol_frame in frame.groupby("symbol", sort=True):
         previous_close = None
         for trade_date, day in symbol_frame.groupby("trade_date", sort=True):
-            day = day.sort_values("timestamp")
+            day = day.sort_values("timestamp").copy()
             if len(day) < 30:
                 continue
 
-            opening = day.iloc[0]
-            first10 = first_n_minutes(day, 10)
-            if len(first10) < 10:
+            first10 = opening_window(day, 10)
+            opening_complete = bool(first10[["open", "high", "low", "close", "volume"]].notna().all().all())
+            opening_missing_bars = int(first10["close"].isna().sum())
+            if not opening_complete:
+                # The first 10-minute behaviour is a core research variable. Never compress
+                # missing minutes and pretend later candles are the opening ten minutes.
+                previous_close = float(day.iloc[-1]["close"])
                 continue
+
+            opening = first10.iloc[0]
             close10 = float(first10.iloc[-1]["close"])
             day_close = float(day.iloc[-1]["close"])
             day_high = float(day["high"].max())
@@ -50,9 +67,9 @@ def daily_features(frame: pd.DataFrame) -> pd.DataFrame:
             first10_return = (close10 / open_price - 1.0) if open_price else 0.0
             first10_range = (first10_high - first10_low) / open_price if open_price else 0.0
 
-            post10 = day.iloc[10:]
-            post10_up = (float(post10["high"].max()) / close10 - 1.0) if close10 else 0.0
-            post10_down = (float(post10["low"].min()) / close10 - 1.0) if close10 else 0.0
+            post10 = day[day["timestamp"] >= first10.iloc[-1]["timestamp"] + pd.Timedelta(minutes=1)]
+            post10_up = (float(post10["high"].max()) / close10 - 1.0) if not post10.empty and close10 else 0.0
+            post10_down = (float(post10["low"].min()) / close10 - 1.0) if not post10.empty and close10 else 0.0
             day_range = (day_high - day_low) / open_price if open_price else 0.0
             traded_value = float((day["close"] * day["volume"]).sum())
             gap = None if previous_close is None else (open_price / previous_close - 1.0)
@@ -89,6 +106,9 @@ def daily_features(frame: pd.DataFrame) -> pd.DataFrame:
                 "close_continuation_after10": continuation,
                 "reversal_flag": reversal,
                 "bars": len(day),
+                "session_coverage_pct": len(day) / EXPECTED_BARS_PER_SESSION * 100.0,
+                "opening10_complete": True,
+                "opening10_missing_bars": opening_missing_bars,
             })
             previous_close = day_close
     return pd.DataFrame(rows)
@@ -123,6 +143,9 @@ def summarize(daily: pd.DataFrame) -> pd.DataFrame:
             "continuation_rate_after10": float(cont.mean()) if not cont.empty else float("nan"),
             "reversal_rate": float(g["reversal_flag"].mean()),
             "directional_days_rate": float((g["first10_direction"] != 0).mean()),
+            "median_session_coverage_pct": q(g["session_coverage_pct"], 0.50),
+            "p10_session_coverage_pct": q(g["session_coverage_pct"], 0.10),
+            "opening10_complete_rate": float(g["opening10_complete"].mean()),
         })
     return pd.DataFrame(grouped)
 
@@ -146,7 +169,7 @@ def main() -> None:
         if not features.empty:
             daily_parts.append(features)
     if not daily_parts:
-        raise RuntimeError("No valid daily features could be produced from the downloaded datasets.")
+        raise RuntimeError("No valid daily behavioural features could be produced from the downloaded datasets.")
 
     daily = pd.concat(daily_parts, ignore_index=True)
     summary = summarize(daily)

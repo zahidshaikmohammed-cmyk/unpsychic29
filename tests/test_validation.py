@@ -18,9 +18,9 @@ class ValidationTests(unittest.TestCase):
     def _base(self) -> pd.DataFrame:
         return pd.DataFrame(
             {
-                "timestamp": pd.to_datetime(
+                "timestamp": pd.Series(pd.to_datetime(
                     ["2026-08-28 09:15:00+05:30", "2026-08-28 09:16:00+05:30"]
-                ),
+                )),
                 "open": [100.0, 101.0],
                 "high": [101.0, 102.0],
                 "low": [99.0, 100.0],
@@ -30,11 +30,26 @@ class ValidationTests(unittest.TestCase):
             }
         )
 
+    def test_regular_session_is_0915_inclusive_and_1530_exclusive(self) -> None:
+        timestamps = pd.Series(pd.to_datetime([
+            "2026-08-28 09:14:00+05:30",
+            "2026-08-28 09:15:00+05:30",
+            "2026-08-28 15:29:00+05:30",
+            "2026-08-28 15:30:00+05:30",
+        ]))
+        minute = timestamps.dt.hour * 60 + timestamps.dt.minute
+        regular = timestamps[(minute >= 9 * 60 + 15) & (minute < 15 * 60 + 30)]
+        self.assertEqual(regular.tolist(), [
+            pd.Timestamp("2026-08-28 09:15:00+05:30"),
+            pd.Timestamp("2026-08-28 15:29:00+05:30"),
+        ])
+
     def test_clean_frame_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = validate_frame(self._write(self._base(), Path(tmp)))
         self.assertEqual(report["status"], "OK")
         self.assertEqual(report["failure_reasons"], [])
+        self.assertEqual(report["warning_reasons"], [])
 
     def test_invalid_high_fails_without_relaxation(self) -> None:
         frame = self._base()

@@ -1,0 +1,102 @@
+name: UNPSYCHIC29 Stage 2 - Candidate Universe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unpsychic29-stage2-universe
+  cancel-in-progress: false
+
+jobs:
+  build-universe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout acquisition branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-acquisition
+          fetch-depth: 1
+
+      - name: Runner and repository preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: ${RUNNER_NAME}"
+          echo "OS: ${RUNNER_OS}"
+          python3 --version
+          test "${GITHUB_REF_NAME}" = "main"
+          test -f requirements.txt
+          test -f src/build_universe.py
+          test -f src/dhan_historical.py
+          test -f tests/test_universe.py
+          test -f tests/test_dhan_historical.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile and deterministic tests before network access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+          python src/build_universe.py --self-test
+
+      - name: Build NIFTY 500 candidate universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/build_universe.py --output artifacts/universe
+
+      - name: Verify Stage 2 artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s artifacts/universe/nifty500_constituents.csv
+          test -s artifacts/universe/candidate_universe.csv
+          test -s artifacts/universe/universe_manifest.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+
+          root = Path("artifacts/universe")
+          manifest = json.loads((root / "universe_manifest.json").read_text(encoding="utf-8"))
+          universe = pd.read_csv(root / "candidate_universe.csv")
+          if manifest["constituent_count"] != manifest["resolved_count"]:
+              raise SystemExit("Stage 2 verification failed: unresolved constituents remain.")
+          if len(universe) != manifest["resolved_count"]:
+              raise SystemExit("Stage 2 verification failed: manifest count != file row count.")
+          if universe["symbol"].duplicated().any():
+              raise SystemExit("Stage 2 verification failed: duplicate symbols.")
+          if universe["security_id"].duplicated().any():
+              raise SystemExit("Stage 2 verification failed: duplicate security IDs.")
+          if set(universe["exchange_segment"]) != {"NSE_EQ"}:
+              raise SystemExit("Stage 2 verification failed: non-NSE_EQ segment present.")
+          if set(universe["instrument"]) != {"EQUITY"}:
+              raise SystemExit("Stage 2 verification failed: non-EQUITY instrument present.")
+          print("Stage 2 artifact verification: PASS")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload Stage 2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage2-universe-${{ github.run_number }}
+          path: artifacts/universe/
+          if-no-files-found: error
+          retention-days: 14

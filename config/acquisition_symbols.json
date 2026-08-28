@@ -1,0 +1,10 @@
+{
+  "description": "Initial controlled validation universe. Expand only after the acquisition pipeline passes.",
+  "symbols": [
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "INFY",
+    "TCS"
+  ]
+}

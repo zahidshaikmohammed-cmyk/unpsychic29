@@ -45,14 +45,16 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("invalid_high", report["failure_reasons"])
         self.assertGreater(report["invalid_high_rows"], 0)
 
-    def test_out_of_session_fails(self) -> None:
+    def test_out_of_session_is_quarantined_as_warning(self) -> None:
         frame = self._base()
         frame.loc[1, "timestamp"] = pd.Timestamp("2026-08-28 15:31:00", tz="Asia/Kolkata")
         with tempfile.TemporaryDirectory() as tmp:
             report = validate_frame(self._write(frame, Path(tmp)))
-        self.assertEqual(report["status"], "CHECK")
-        self.assertIn("out_of_session", report["failure_reasons"])
+        self.assertEqual(report["status"], "OK")
+        self.assertEqual(report["failure_reasons"], [])
+        self.assertIn("out_of_session_rows_quarantined", report["warning_reasons"])
         self.assertEqual(report["out_of_session_rows"], 1)
+        self.assertEqual(report["rows_after_session_filter"], 1)
 
     def test_null_volume_fails(self) -> None:
         frame = self._base()

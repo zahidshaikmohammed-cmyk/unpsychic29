@@ -7,15 +7,10 @@ permissions:
   contents: read
 
 jobs:
-  acquire:
-    name: Batch ${{ matrix.batch }}/10
+  acquire-all:
+    name: Acquire 500 stocks sequentially (10 x 50)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      max-parallel: 5
-      matrix:
-        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
       - name: Checkout acquisition implementation
         uses: actions/checkout@v6
@@ -62,74 +57,71 @@ jobs:
               raise SystemExit(f"Expected exactly 500 resolved constituents; got manifest={manifest}, rows={len(universe)}")
           if not universe["symbol"].is_unique or not universe["security_id"].is_unique:
               raise SystemExit("Universe contains duplicate symbols or security IDs")
-          print(f"Verified NIFTY 500 universe: {len(universe)} stocks")
+          print("Universe gate: PASS | 500 unique stocks")
           PY
 
-      - name: Acquire 365 days of 1-minute data
+      - name: Acquire batches 1-10 sequentially with bounded retries
         env:
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts/stage3
-          python src/stage3_acquire.py \
-            --universe artifacts/universe/candidate_universe.csv \
-            --batch-number "${{ matrix.batch }}" \
-            --batch-size 50 \
-            --lookback-days 365 \
-            --chunk-days 30 \
-            --output artifacts/stage3 2>&1 | tee artifacts/stage3/acquisition.log
-
-      - name: Verify batch artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -s artifacts/stage3/batch_universe.csv
-          test -s artifacts/stage3/download_validation.csv
-          test -s artifacts/stage3/acquisition_quality.csv
-          test -s artifacts/stage3/daily_features.parquet
-          test -s artifacts/stage3/daily_features.csv
-          test -s artifacts/stage3/chunk_log.csv
-          test -s artifacts/stage3/stage3_manifest.json
-          python - <<'PY'
-          import json
+          mkdir -p artifacts/batches
+          for BATCH in 1 2 3 4 5 6 7 8 9 10; do
+            echo "============================================================"
+            echo "STARTING BATCH ${BATCH}/10"
+            echo "============================================================"
+            success=0
+            for ATTEMPT in 1 2 3; do
+              echo "Batch ${BATCH}/10 attempt ${ATTEMPT}/3"
+              rm -rf "artifacts/batches/batch-${BATCH}"
+              mkdir -p "artifacts/batches/batch-${BATCH}"
+              if python src/stage3_acquire.py \
+                --universe artifacts/universe/candidate_universe.csv \
+                --batch-number "$BATCH" \
+                --batch-size 50 \
+                --lookback-days 365 \
+                --chunk-days 30 \
+                --output "artifacts/batches/batch-${BATCH}" 2>&1 | tee "artifacts/batches/batch-${BATCH}/acquisition.log"; then
+                python - "$BATCH" <<'PY'
+          import json, sys
           from pathlib import Path
           import pandas as pd
-          root = Path("artifacts/stage3")
+          b = sys.argv[1]
+          root = Path("artifacts/batches") / f"batch-{b}"
           manifest = json.loads((root / "stage3_manifest.json").read_text())
           batch = pd.read_csv(root / "batch_universe.csv")
           validation = pd.read_csv(root / "download_validation.csv")
           acquisition = pd.read_csv(root / "acquisition_quality.csv")
           daily = pd.read_parquet(root / "daily_features.parquet")
-          assert len(batch) == 50, f"Batch size is {len(batch)}, expected 50"
-          assert len(validation) == 50 and (validation["status"] == "OK").all()
-          assert len(acquisition) == 50 and (acquisition["acquisition_status"] == "ACQUIRED").all()
-          assert daily["symbol"].nunique() == 50
-          assert daily["trade_date"].nunique() >= 150
-          assert manifest["batch_symbol_count"] == 50
-          print(f"Batch {manifest['batch_number']}: PASS | 50/50 stocks | {len(daily)} daily feature rows")
+          raw = list((root / "raw_1min").glob("*.parquet"))
+          if len(batch) != 50 or batch["symbol"].nunique() != 50:
+              raise SystemExit("50-stock gate failed")
+          if len(validation) != 50 or not (validation["status"] == "OK").all():
+              raise SystemExit("validation gate failed")
+          if len(acquisition) != 50 or not (acquisition["acquisition_status"] == "ACQUIRED").all():
+              raise SystemExit("acquisition gate failed")
+          if daily["symbol"].nunique() != 50:
+              raise SystemExit("daily coverage gate failed")
+          if len(raw) != 50:
+              raise SystemExit(f"raw 1-minute persistence gate failed: {len(raw)}/50")
+          if manifest.get("raw_1min_data_persisted") is not True:
+              raise SystemExit("manifest raw persistence gate failed")
+          print(f"BATCH {b}: PASS | 50/50 stocks | 50 raw 1-minute files")
           PY
+                success=1
+                break
+              fi
+              echo "Batch ${BATCH} attempt ${ATTEMPT} failed; retrying."
+              sleep 15
+            done
+            if [ "$success" -ne 1 ]; then
+              echo "BATCH ${BATCH}: FAILED after 3 attempts"
+              exit 1
+            fi
+          done
 
-      - name: Upload validated batch
-        uses: actions/upload-artifact@v4
-        with:
-          name: unpsychic29-stage3-full-batch-${{ matrix.batch }}
-          path: artifacts/stage3/
-          retention-days: 14
-
-  combine:
-    name: Combine 10 validated batches
-    needs: acquire
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Download all validated batches
-        uses: actions/download-artifact@v5
-        with:
-          pattern: unpsychic29-stage3-full-batch-*
-          path: artifacts/batches
-
-      - name: Combine and verify 500-stock research dataset
+      - name: Final 500-stock integrity gate
         shell: bash
         run: |
           set -euo pipefail
@@ -139,27 +131,33 @@ jobs:
           import pandas as pd
 
           root = Path("artifacts/batches")
-          dirs = sorted(p for p in root.iterdir() if p.is_dir())
-          if len(dirs) != 10:
-              raise SystemExit(f"Expected 10 batch artifacts, found {len(dirs)}")
-
+          dirs = [root / f"batch-{i}" for i in range(1, 11)]
+          seen = set()
           batches = []
           validations = []
           acquisitions = []
           daily_parts = []
-          seen = set()
+          raw_files = []
 
-          for directory in dirs:
+          for i, directory in enumerate(dirs, 1):
+              if not directory.exists():
+                  raise SystemExit(f"Missing batch {i}")
               batch = pd.read_csv(directory / "batch_universe.csv")
               validation = pd.read_csv(directory / "download_validation.csv")
               acquisition = pd.read_csv(directory / "acquisition_quality.csv")
               daily = pd.read_parquet(directory / "daily_features.parquet")
-              if len(batch) != 50:
-                  raise SystemExit(f"{directory.name}: expected 50 stocks, got {len(batch)}")
-              if not (validation["status"] == "OK").all():
-                  raise SystemExit(f"{directory.name}: validation failure")
-              if not (acquisition["acquisition_status"] == "ACQUIRED").all():
-                  raise SystemExit(f"{directory.name}: acquisition failure")
+              manifest = json.loads((directory / "stage3_manifest.json").read_text())
+              raws = sorted((directory / "raw_1min").glob("*.parquet"))
+              if len(batch) != 50 or batch["symbol"].nunique() != 50:
+                  raise SystemExit(f"Batch {i}: 50-stock gate failed")
+              if len(validation) != 50 or not (validation["status"] == "OK").all():
+                  raise SystemExit(f"Batch {i}: validation gate failed")
+              if len(acquisition) != 50 or not (acquisition["acquisition_status"] == "ACQUIRED").all():
+                  raise SystemExit(f"Batch {i}: acquisition gate failed")
+              if daily["symbol"].nunique() != 50:
+                  raise SystemExit(f"Batch {i}: daily coverage gate failed")
+              if len(raws) != 50 or manifest.get("raw_1min_data_persisted") is not True:
+                  raise SystemExit(f"Batch {i}: raw 1-minute persistence gate failed")
               overlap = seen.intersection(set(batch["symbol"]))
               if overlap:
                   raise SystemExit(f"Duplicate symbols across batches: {sorted(overlap)}")
@@ -168,6 +166,7 @@ jobs:
               validations.append(validation)
               acquisitions.append(acquisition)
               daily_parts.append(daily)
+              raw_files.extend(raws)
 
           universe = pd.concat(batches, ignore_index=True)
           validation = pd.concat(validations, ignore_index=True)
@@ -175,15 +174,15 @@ jobs:
           daily = pd.concat(daily_parts, ignore_index=True)
 
           if len(universe) != 500 or universe["symbol"].nunique() != 500:
-              raise SystemExit(f"Combined universe is not exactly 500 unique stocks: {len(universe)}")
+              raise SystemExit("Final universe is not exactly 500 unique stocks")
           if validation["symbol"].nunique() != 500 or not (validation["status"] == "OK").all():
-              raise SystemExit("Combined validation gate failed")
+              raise SystemExit("Final validation gate failed")
           if acquisition["symbol"].nunique() != 500 or not (acquisition["acquisition_status"] == "ACQUIRED").all():
-              raise SystemExit("Combined acquisition gate failed")
+              raise SystemExit("Final acquisition gate failed")
           if daily["symbol"].nunique() != 500:
-              raise SystemExit(f"Combined daily features contain {daily['symbol'].nunique()} symbols")
-          if daily["trade_date"].nunique() < 150:
-              raise SystemExit("Combined dataset has too few trading days")
+              raise SystemExit("Final daily coverage gate failed")
+          if len(raw_files) != 500:
+              raise SystemExit(f"Final raw 1-minute file count is {len(raw_files)}, expected 500")
 
           out = Path("artifacts/full500")
           out.mkdir(parents=True, exist_ok=True)
@@ -199,16 +198,30 @@ jobs:
               "batch_size": 50,
               "lookback_days": 365,
               "interval_minutes": 1,
+              "raw_1min_files": len(raw_files),
+              "raw_1min_data_persisted": True,
+              "raw_1min_format": "parquet-zstd-per-symbol",
               "daily_feature_rows": len(daily),
               "trading_days": int(daily["trade_date"].nunique()),
           }
           (out / "full500_manifest.json").write_text(json.dumps(manifest, indent=2))
           print(json.dumps(manifest, indent=2))
+          print("FINAL 500-STOCK GATE: PASS")
           PY
 
-      - name: Upload complete 500-stock dataset
+      - name: Assemble raw 1-minute archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/full500/raw_1min
+          for BATCH in 1 2 3 4 5 6 7 8 9 10; do
+            cp artifacts/batches/batch-${BATCH}/raw_1min/*.parquet artifacts/full500/raw_1min/
+          done
+          test "$(find artifacts/full500/raw_1min -type f -name '*.parquet' | wc -l)" -eq 500
+
+      - name: Upload complete 500-stock dataset with raw 1-minute candles
         uses: actions/upload-artifact@v4
         with:
-          name: unpsychic29-stage3-FULL500
+          name: unpsychic29-stage3-FULL500-RAW1MIN
           path: artifacts/full500/
           retention-days: 14

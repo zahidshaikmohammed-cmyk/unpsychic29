@@ -56,6 +56,14 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(report["out_of_session_rows"], 1)
         self.assertEqual(report["rows_after_session_filter"], 1)
 
+    def test_excessive_out_of_session_data_fails(self) -> None:
+        frame = pd.concat([self._base()] * 100, ignore_index=True)
+        frame["timestamp"] = pd.date_range("2026-08-28 00:00:00+05:30", periods=len(frame), freq="min")
+        with tempfile.TemporaryDirectory() as tmp:
+            report = validate_frame(self._write(frame, Path(tmp)))
+        self.assertEqual(report["status"], "CHECK")
+        self.assertIn("excessive_out_of_session_rows", report["failure_reasons"])
+
     def test_null_volume_fails(self) -> None:
         frame = self._base()
         frame.loc[0, "volume"] = None

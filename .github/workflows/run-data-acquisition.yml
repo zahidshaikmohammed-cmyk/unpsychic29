@@ -1,0 +1,149 @@
+name: UNPSYCHIC29 Data Acquisition
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Historical lookback days"
+        required: true
+        default: "30"
+        type: string
+      max_symbols:
+        description: "Maximum symbols for this run"
+        required: true
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unpsychic29-data-acquisition
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: data-acquisition
+
+jobs:
+  acquire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout acquisition branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-acquisition
+          fetch-depth: 1
+
+      - name: Runner and repository preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: ${RUNNER_NAME}"
+          echo "OS: ${RUNNER_OS}"
+          python3 --version
+          test "${GITHUB_REF_NAME}" = "main"
+          test -f requirements.txt
+          test -f config/research.json
+          test -f src/dhan_historical.py
+          test -f src/research_metrics.py
+          test -f tests/test_dhan_historical.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile and unit-test before network access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+          python src/dhan_historical.py --self-test
+
+      - name: Dhan credential and Data API preflight
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+          if not token:
+              raise SystemExit("FAIL: DHAN_ACCESS_TOKEN GitHub secret is missing.")
+
+          r = requests.get(
+              "https://api.dhan.co/v2/profile",
+              headers={"Accept": "application/json", "access-token": token},
+              timeout=30,
+          )
+          try:
+              body = r.json()
+          except ValueError:
+              raise SystemExit(f"FAIL: Dhan profile returned non-JSON HTTP {r.status_code}.")
+
+          if r.status_code != 200:
+              code = body.get("errorCode") or body.get("errorType") or "UNKNOWN"
+              msg = body.get("errorMessage") or "Dhan rejected the token."
+              raise SystemExit(f"FAIL: Dhan authentication: {code}: {msg}")
+          if not body.get("dhanClientId"):
+              raise SystemExit("FAIL: Dhan profile has no dhanClientId.")
+          if str(body.get("dataPlan", "")).strip().lower() != "active":
+              raise SystemExit(f"FAIL: Dhan Data API is not active: {body.get('dataPlan')!r}")
+
+          print("Dhan preflight: PASS")
+          print(f"Data plan: {body.get('dataPlan')}")
+          print(f"Token validity: {body.get('tokenValidity', 'unknown')}")
+          PY
+
+      - name: Acquire and validate historical data
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/dhan_historical.py \
+            --config config/research.json \
+            --days "${{ inputs.days }}" \
+            --max-symbols "${{ inputs.max_symbols }}"
+
+      - name: Calculate research metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/research_metrics.py \
+            --input artifacts/raw_1min \
+            --output artifacts/research
+
+      - name: Verify artifact contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s artifacts/dhan_instrument_master.csv
+          test -s artifacts/resolved_test_universe.csv
+          test -s artifacts/download_validation.csv
+          test -d artifacts/raw_1min
+          test -n "$(find artifacts/raw_1min -type f -name '*.parquet' -print -quit)"
+          test -d artifacts/research
+          echo "Artifact preflight: PASS"
+          find artifacts -maxdepth 3 -type f -printf '%p %s bytes\n' | sort
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-historical-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

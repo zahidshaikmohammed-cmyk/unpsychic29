@@ -61,15 +61,29 @@ class ValidationTests(unittest.TestCase):
         self.assertGreater(report["invalid_high_rows"], 0)
 
     def test_out_of_session_is_quarantined_as_warning(self) -> None:
-        frame = self._base()
-        frame.loc[1, "timestamp"] = pd.Timestamp("2026-08-28 15:31:00", tz="Asia/Kolkata")
+        timestamps = list(pd.date_range(
+            "2026-08-28 09:15:00+05:30",
+            "2026-08-28 15:29:00+05:30",
+            freq="min",
+        ))
+        timestamps.append(pd.Timestamp("2026-08-28 15:31:00+05:30"))
+        n = len(timestamps)
+        frame = pd.DataFrame({
+            "timestamp": timestamps,
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.5] * n,
+            "volume": [1000] * n,
+            "security_id": ["1"] * n,
+        })
         with tempfile.TemporaryDirectory() as tmp:
             report = validate_frame(self._write(frame, Path(tmp)))
         self.assertEqual(report["status"], "OK")
         self.assertEqual(report["failure_reasons"], [])
         self.assertIn("out_of_session_rows_quarantined", report["warning_reasons"])
         self.assertEqual(report["out_of_session_rows"], 1)
-        self.assertEqual(report["rows_after_session_filter"], 1)
+        self.assertEqual(report["rows_after_session_filter"], 375)
 
     def test_excessive_out_of_session_data_fails(self) -> None:
         frame = pd.concat([self._base()] * 100, ignore_index=True)

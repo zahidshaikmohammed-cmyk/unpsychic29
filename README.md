@@ -40,7 +40,7 @@ Stage 3 uses `UNPSYCHIC29 Stage 3 - One-Year 1-Min Acquisition` from `main`, whi
 - No raw historical candles are committed to Git or retained as a large Actions artifact
 - Each batch produces a compact artifact containing the batch universe, validation report, chunk log, daily features, and manifest
 
-This batching is deliberate. Dhan currently documents up to five years of minute-level intraday history and a Data API allowance of up to 100,000 requests/day, while GitHub Free provides only 500 MB of Actions artifact storage. The design therefore separates acquisition from compact research retention. citeturn2search0turn0search2turn1search0
+This batching separates acquisition from compact research retention so the project remains compatible with the free GitHub Actions storage allowance.
 
 ## Stage 2 principle
 

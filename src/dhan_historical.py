@@ -165,6 +165,27 @@ def canonical_session_mask(timestamps: pd.Series) -> pd.Series:
     return (local.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (local.dt.time < pd.Timestamp(MARKET_CLOSE).time())
 
 
+def download_symbol(session: requests.Session, access_token: str, symbol: str, security_id: str, start: date, end: date, chunk_days: int, output_dir: Path) -> Path:
+    parts: list[pd.DataFrame] = []
+    chunks = list(date_chunks(start, end, chunk_days))
+    if not chunks:
+        raise RuntimeError(f"No date range generated for {symbol}: {start} -> {end}")
+    for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        print(f"  {symbol}: chunk {index}/{len(chunks)} {chunk_start} -> {chunk_end}")
+        frame = fetch_chunk(session, access_token, security_id, chunk_start, chunk_end)
+        if not frame.empty:
+            parts.append(frame)
+        time.sleep(0.30)
+    result = pd.concat(parts, ignore_index=True) if parts else empty_frame()
+    if not result.empty:
+        result = result.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    result.insert(0, "symbol", symbol)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{symbol}.parquet"
+    result.to_parquet(path, index=False)
+    return path
+
+
 def validate_frame(path: Path) -> dict:
     frame = pd.read_parquet(path)
     if frame.empty:
@@ -242,11 +263,51 @@ def self_test() -> None:
     print("Self-test: PASS")
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config/research.json")
+    parser.add_argument("--days", type=int, default=None)
+    parser.add_argument("--max-symbols", type=int, default=None)
+    parser.add_argument("--output", default="artifacts/raw_1min")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
-    else:
-        raise SystemExit("Use src/stage3_acquire.py for acquisition. This module is a library plus self-test.")
+        return
+    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    access_token = require_access_token()
+    lookback_days = int(args.days if args.days is not None else config["lookback_days"])
+    if lookback_days <= 0:
+        raise ValueError("--days must be positive")
+    max_symbols = args.max_symbols if args.max_symbols is not None else config.get("max_symbols")
+    if max_symbols is not None and int(max_symbols) <= 0:
+        raise ValueError("--max-symbols must be positive")
+    chunk_days = int(config.get("chunk_days", 20))
+    end = datetime.now(IST).date() + timedelta(days=1)
+    start = end - timedelta(days=lookback_days)
+    symbols = [str(s).upper() for s in config["test_symbols"]]
+    if max_symbols:
+        symbols = symbols[: int(max_symbols)]
+    if not symbols:
+        raise RuntimeError("No test symbols configured.")
+    session = requests.Session()
+    session.headers.update({"User-Agent": "UNPSYCHIC29/1.0"})
+    profile = check_dhan_access(session, access_token)
+    print(f"Dhan preflight PASS: client {profile['dhanClientId']}; data plan {profile.get('dataPlan')}")
+    master = fetch_instrument_master(session)
+    Path("artifacts").mkdir(exist_ok=True)
+    master.to_csv("artifacts/dhan_instrument_master.csv", index=False)
+    resolved = resolve_equities(master, symbols)
+    resolved.to_csv("artifacts/resolved_test_universe.csv", index=False)
+    output_dir = Path(args.output)
+    reports: list[dict] = []
+    for row in resolved.itertuples(index=False):
+        path = download_symbol(session, access_token, row.symbol, row.security_id, start, end, chunk_days, output_dir)
+        report = validate_frame(path)
+        reports.append(report)
+    validation = pd.DataFrame(reports)
+    validation.to_csv("artifacts/download_validation.csv", index=False)
+    if len(validation) != len(resolved) or (validation["status"] != "OK").all() is False:
+        bad = validation.loc[validation["status"] != "OK", "symbol"].tolist()
+        raise RuntimeError("Historical-data structural validation failed for: " + ", ".join(bad))
+    print("Historical download validation: PASS")

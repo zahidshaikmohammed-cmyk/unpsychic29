@@ -181,7 +181,7 @@ def download_symbol(session: requests.Session, access_token: str, symbol: str, s
 def validate_frame(path: Path) -> dict:
     frame = pd.read_parquet(path)
     if frame.empty:
-        return {"symbol": path.stem, "rows": 0, "status": "EMPTY", "reason": "Dhan returned no candles for the requested period."}
+        return {"symbol": path.stem, "rows": 0, "status": "EMPTY", "reason": "Dhan returned no candles for the requested period.", "failure_reasons": ["empty_data"]}
     timestamps = pd.to_datetime(frame["timestamp"], utc=True).dt.tz_convert(IST)
     duplicate_count = int(timestamps.duplicated().sum())
     bad_ohlc = int((frame[["open", "high", "low", "close"]] <= 0).any(axis=1).sum())
@@ -191,10 +191,14 @@ def validate_frame(path: Path) -> dict:
     in_session = (timestamps.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (timestamps.dt.time <= pd.Timestamp(MARKET_CLOSE).time())
     out_of_session = int((~in_session).sum())
     out_of_session_samples = timestamps.loc[~in_session].head(10).astype(str).tolist()
-    bad_ohlc_samples = frame.loc[(frame[["open", "high", "low", "close"]] <= 0).any(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    invalid_high_samples = frame.loc[frame["high"] < frame[["open", "close", "low"]].max(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    invalid_low_samples = frame.loc[frame["low"] > frame[["open", "close", "high"]].min(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
-    null_volume_samples = frame.loc[frame["volume"].isna(), ["timestamp", "volume"]].head(5).to_dict("records")
+    bad_ohlc_mask = (frame[["open", "high", "low", "close"]] <= 0).any(axis=1)
+    invalid_high_mask = frame["high"] < frame[["open", "close", "low"]].max(axis=1)
+    invalid_low_mask = frame["low"] > frame[["open", "close", "high"]].min(axis=1)
+    null_volume_mask = frame["volume"].isna()
+    bad_ohlc_samples = frame.loc[bad_ohlc_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    invalid_high_samples = frame.loc[invalid_high_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    invalid_low_samples = frame.loc[invalid_low_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    null_volume_samples = frame.loc[null_volume_mask, ["timestamp", "volume"]].head(5).to_dict("records")
     by_day = frame.assign(_ts=timestamps).sort_values("_ts").groupby(timestamps.dt.date)
     max_intraday_gap_minutes = 0.0
     for _, day in by_day:
@@ -215,13 +219,24 @@ def validate_frame(path: Path) -> dict:
     if out_of_session:
         failures.append("out_of_session")
     return {
-        "symbol": path.stem, "rows": int(len(frame)), "first_timestamp": str(timestamps.min()), "last_timestamp": str(timestamps.max()),
-        "trading_days": int(timestamps.dt.date.nunique()), "duplicate_timestamps": duplicate_count, "bad_ohlc_rows": bad_ohlc,
-        "invalid_high_rows": invalid_high, "invalid_low_rows": invalid_low, "null_volume_rows": null_volume_rows if False else null_volume,
-        "out_of_session_rows": out_of_session, "max_intraday_gap_minutes": max_intraday_gap_minutes,
-        "failure_reasons": failures, "out_of_session_samples": out_of_session_samples,
-        "bad_ohlc_samples": bad_ohlc_samples, "invalid_high_samples": invalid_high_samples,
-        "invalid_low_samples": invalid_low_samples, "null_volume_samples": null_volume_samples,
+        "symbol": path.stem,
+        "rows": int(len(frame)),
+        "first_timestamp": str(timestamps.min()),
+        "last_timestamp": str(timestamps.max()),
+        "trading_days": int(timestamps.dt.date.nunique()),
+        "duplicate_timestamps": duplicate_count,
+        "bad_ohlc_rows": bad_ohlc,
+        "invalid_high_rows": invalid_high,
+        "invalid_low_rows": invalid_low,
+        "null_volume_rows": null_volume,
+        "out_of_session_rows": out_of_session,
+        "max_intraday_gap_minutes": max_intraday_gap_minutes,
+        "failure_reasons": failures,
+        "out_of_session_samples": out_of_session_samples,
+        "bad_ohlc_samples": bad_ohlc_samples,
+        "invalid_high_samples": invalid_high_samples,
+        "invalid_low_samples": invalid_low_samples,
+        "null_volume_samples": null_volume_samples,
         "status": "OK" if not failures else "CHECK",
     }
 

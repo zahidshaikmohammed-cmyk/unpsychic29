@@ -100,13 +100,9 @@ def date_chunks(start: date, end: date, chunk_days: int) -> Iterable[tuple[date,
 
 def fetch_chunk(session: requests.Session, access_token: str, security_id: str, start: date, end: date, interval: str = "1", max_retries: int = 6) -> pd.DataFrame:
     payload = {
-        "securityId": str(security_id),
-        "exchangeSegment": "NSE_EQ",
-        "instrument": "EQUITY",
-        "interval": str(interval),
-        "oi": False,
-        "fromDate": f"{start.isoformat()} {MARKET_OPEN}",
-        "toDate": f"{end.isoformat()} {MARKET_CLOSE}",
+        "securityId": str(security_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY",
+        "interval": str(interval), "oi": False,
+        "fromDate": f"{start.isoformat()} {MARKET_OPEN}", "toDate": f"{end.isoformat()} {MARKET_CLOSE}",
     }
     headers = {"Accept": "application/json", "Content-Type": "application/json", "access-token": access_token}
     for attempt in range(1, max_retries + 1):
@@ -159,6 +155,8 @@ def response_to_frame(body: dict, security_id: str) -> pd.DataFrame:
     frame["security_id"] = str(security_id)
     if frame[["timestamp", "open", "high", "low", "close"]].isna().any().any():
         raise RuntimeError("Dhan returned null/unparseable timestamp or OHLC values.")
+    if frame["volume"].isna().any():
+        raise RuntimeError("Dhan returned null volume values.")
     return frame[["timestamp", "open", "high", "low", "close", "volume", "security_id"]]
 
 
@@ -178,6 +176,8 @@ def validate_frame(path: Path) -> dict:
     invalid_high = int((frame["high"] < numeric[["open", "close", "low"]].max(axis=1)).sum())
     invalid_low = int((frame["low"] > numeric[["open", "close", "high"]].min(axis=1)).sum())
     null_volume = int(frame["volume"].isna().sum())
+    negative_volume = int((frame["volume"] < 0).sum())
+    non_minute_aligned = int(((timestamps.dt.second != 0) | (timestamps.dt.microsecond != 0)).sum())
     in_session = canonical_session_mask(timestamps)
     out_of_session = int((~in_session).sum())
     bad_ohlc_mask = (numeric <= 0).any(axis=1)
@@ -196,6 +196,10 @@ def validate_frame(path: Path) -> dict:
         failures.append("invalid_low")
     if null_volume:
         failures.append("null_volume")
+    if negative_volume:
+        failures.append("negative_volume")
+    if non_minute_aligned:
+        failures.append("non_minute_aligned_timestamps")
     if out_of_session:
         warnings.append("out_of_session_rows_quarantined")
     clean = frame.loc[in_session].copy()
@@ -211,23 +215,13 @@ def validate_frame(path: Path) -> dict:
             if not diffs.empty:
                 max_intraday_gap_minutes = max(max_intraday_gap_minutes, float(diffs.max()))
     return {
-        "symbol": path.stem,
-        "rows": int(len(frame)),
-        "rows_after_session_filter": int(len(clean)),
-        "first_timestamp": str(timestamps.min()),
-        "last_timestamp": str(timestamps.max()),
-        "trading_days": trading_days,
-        "expected_regular_session_bars": expected_bars,
-        "bar_coverage_pct": coverage_pct,
-        "duplicate_timestamps": duplicate_count,
-        "bad_ohlc_rows": bad_ohlc,
-        "invalid_high_rows": invalid_high,
-        "invalid_low_rows": invalid_low,
-        "null_volume_rows": null_volume,
-        "out_of_session_rows": out_of_session,
-        "max_intraday_gap_minutes": max_intraday_gap_minutes,
-        "failure_reasons": failures,
-        "warning_reasons": warnings,
+        "symbol": path.stem, "rows": int(len(frame)), "rows_after_session_filter": int(len(clean)),
+        "first_timestamp": str(timestamps.min()), "last_timestamp": str(timestamps.max()), "trading_days": trading_days,
+        "expected_regular_session_bars": expected_bars, "bar_coverage_pct": coverage_pct,
+        "duplicate_timestamps": duplicate_count, "bad_ohlc_rows": bad_ohlc, "invalid_high_rows": invalid_high,
+        "invalid_low_rows": invalid_low, "null_volume_rows": null_volume, "negative_volume_rows": negative_volume,
+        "non_minute_aligned_timestamps": non_minute_aligned, "out_of_session_rows": out_of_session,
+        "max_intraday_gap_minutes": max_intraday_gap_minutes, "failure_reasons": failures, "warning_reasons": warnings,
         "out_of_session_samples": timestamps.loc[~in_session].head(10).astype(str).tolist(),
         "bad_ohlc_samples": frame.loc[bad_ohlc_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
         "invalid_high_samples": frame.loc[invalid_high_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
@@ -248,42 +242,11 @@ def self_test() -> None:
     print("Self-test: PASS")
 
 
-def main() -> None:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config/research.json")
-    parser.add_argument("--days", type=int, default=None)
-    parser.add_argument("--max-symbols", type=int, default=None)
-    parser.add_argument("--output", default="artifacts/raw_1min")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
-        return
-    config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-    access_token = require_access_token()
-    lookback_days = int(args.days if args.days is not None else config["lookback_days"])
-    if lookback_days <= 0:
-        raise ValueError("--days must be positive")
-    max_symbols = args.max_symbols if args.max_symbols is not None else config.get("max_symbols")
-    if max_symbols is not None and int(max_symbols) <= 0:
-        raise ValueError("--max-symbols must be positive")
-    chunk_days = int(config.get("chunk_days", 20))
-    end = datetime.now(IST).date() + timedelta(days=1)
-    start = end - timedelta(days=lookback_days)
-    symbols = [str(s).upper() for s in config["test_symbols"]]
-    if max_symbols:
-        symbols = symbols[: int(max_symbols)]
-    if not symbols:
-        raise RuntimeError("No test symbols configured.")
-    session = requests.Session()
-    session.headers.update({"User-Agent": "UNPSYCHIC29/1.0"})
-    profile = check_dhan_access(session, access_token)
-    master = fetch_instrument_master(session)
-    resolved = resolve_equities(master, symbols)
-    output_dir = Path(args.output)
-    for row in resolved.itertuples(index=False):
-        path = download_symbol(session, access_token, row.symbol, row.security_id, start, end, chunk_days, output_dir)
-        report = validate_frame(path)
-        if report["status"] != "OK":
-            raise RuntimeError(f"Validation failed: {report}")
-    print(f"Dhan preflight PASS; client={profile.get('dhanClientId')}; validated {len(resolved)} test symbols")
+    else:
+        raise SystemExit("Use src/stage3_acquire.py for acquisition. This module is a library plus self-test.")

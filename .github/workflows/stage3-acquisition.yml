@@ -118,13 +118,27 @@ jobs:
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p artifacts/stage3
+          set +e
           python src/stage3_acquire.py \
             --universe artifacts/universe/candidate_universe.csv \
             --batch-number "${{ inputs.batch_number }}" \
             --batch-size "${{ inputs.batch_size }}" \
             --lookback-days "${{ inputs.lookback_days }}" \
             --chunk-days "${{ inputs.chunk_days }}" \
-            --output artifacts/stage3
+            --output artifacts/stage3 2>&1 | tee artifacts/stage3/acquisition.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "${status}"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage3-failure-diagnostics-${{ inputs.batch_number }}-${{ github.run_number }}
+          path: artifacts/stage3/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Final artifact integrity gate
         shell: bash

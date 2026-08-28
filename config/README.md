@@ -1,0 +1,1 @@
+This directory contains version-controlled research configuration only. Historical market data is never committed here; workflow outputs are published as GitHub Actions artifacts.

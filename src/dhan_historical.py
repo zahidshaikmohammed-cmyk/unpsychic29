@@ -161,8 +161,9 @@ def response_to_frame(body: dict, security_id: str) -> pd.DataFrame:
     return frame[["timestamp", "open", "high", "low", "close", "volume", "security_id"]]
 
 
-def canonical_session_mask(timestamps: pd.Series) -> pd.Series:
-    local = pd.to_datetime(timestamps, utc=True).dt.tz_convert(IST)
+def canonical_session_mask(timestamps: pd.Series | pd.DatetimeIndex) -> pd.Series:
+    values = timestamps if isinstance(timestamps, pd.Series) else pd.Series(timestamps)
+    local = pd.to_datetime(values, utc=True).dt.tz_convert(IST)
     return (local.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (local.dt.time < pd.Timestamp(MARKET_CLOSE).time())
 
 

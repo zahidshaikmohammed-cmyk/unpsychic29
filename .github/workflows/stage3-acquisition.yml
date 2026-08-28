@@ -1,0 +1,168 @@
+name: UNPSYCHIC29 Stage 3 - One-Year 1-Min Acquisition
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_number:
+        description: "50-stock batch number (1..10 for the NIFTY 500 universe)"
+        required: true
+        default: "1"
+        type: string
+      batch_size:
+        description: "Stocks per batch"
+        required: true
+        default: "50"
+        type: string
+      lookback_days:
+        description: "Calendar-day history; production target is 365"
+        required: true
+        default: "365"
+        type: string
+      chunk_days:
+        description: "Calendar days per Dhan request"
+        required: true
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unpsychic29-stage3-${{ inputs.batch_number }}
+  cancel-in-progress: false
+
+jobs:
+  acquire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout acquisition implementation
+        uses: actions/checkout@v4
+        with:
+          ref: data-acquisition
+          fetch-depth: 1
+
+      - name: Runner and input preflight
+        shell: bash
+        env:
+          BATCH_NUMBER: ${{ inputs.batch_number }}
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          LOOKBACK_DAYS: ${{ inputs.lookback_days }}
+          CHUNK_DAYS: ${{ inputs.chunk_days }}
+        run: |
+          set -euo pipefail
+          echo "Runner: ${RUNNER_NAME}"
+          echo "OS: ${RUNNER_OS}"
+          python3 --version
+          test -f requirements.txt
+          test -f src/build_universe.py
+          test -f src/stage3_acquire.py
+          test -f src/dhan_historical.py
+          test -f src/research_metrics.py
+          test -f tests/test_stage3.py
+          [[ "${BATCH_NUMBER}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${LOOKBACK_DAYS}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${CHUNK_DAYS}" =~ ^[1-9][0-9]*$ ]]
+          (( BATCH_SIZE <= 100 ))
+          (( LOOKBACK_DAYS >= 300 ))
+          (( CHUNK_DAYS <= 30 ))
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile and deterministic tests before network access
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+          python src/dhan_historical.py --self-test
+          python src/stage3_acquire.py --self-test
+
+      - name: Build and verify NIFTY 500 candidate universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/build_universe.py --output artifacts/universe
+          test -s artifacts/universe/candidate_universe.csv
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/universe")
+          manifest = json.loads((root / "universe_manifest.json").read_text(encoding="utf-8"))
+          universe = pd.read_csv(root / "candidate_universe.csv")
+          assert manifest["constituent_count"] == manifest["resolved_count"]
+          assert len(universe) == manifest["resolved_count"]
+          assert universe["symbol"].is_unique
+          assert universe["security_id"].is_unique
+          assert set(universe["exchange_segment"]) == {"NSE_EQ"}
+          assert set(universe["instrument"]) == {"EQUITY"}
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Acquire one-year 1-minute data and extract daily features
+        shell: bash
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          python src/stage3_acquire.py \
+            --universe artifacts/universe/candidate_universe.csv \
+            --batch-number "${{ inputs.batch_number }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --lookback-days "${{ inputs.lookback_days }}" \
+            --chunk-days "${{ inputs.chunk_days }}" \
+            --output artifacts/stage3
+
+      - name: Final artifact integrity gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s artifacts/stage3/batch_universe.csv
+          test -s artifacts/stage3/download_validation.csv
+          test -s artifacts/stage3/daily_features.parquet
+          test -s artifacts/stage3/daily_features.csv
+          test -s artifacts/stage3/chunk_log.csv
+          test -s artifacts/stage3/stage3_manifest.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/stage3")
+          manifest = json.loads((root / "stage3_manifest.json").read_text(encoding="utf-8"))
+          batch = pd.read_csv(root / "batch_universe.csv")
+          validation = pd.read_csv(root / "download_validation.csv")
+          daily = pd.read_parquet(root / "daily_features.parquet")
+          if len(batch) != manifest["batch_symbol_count"]:
+              raise SystemExit("Batch count mismatch")
+          if len(validation) != len(batch):
+              raise SystemExit("Validation count mismatch")
+          if not (validation["status"] == "OK").all():
+              raise SystemExit("A symbol is not OK")
+          if daily["symbol"].nunique() != len(batch):
+              raise SystemExit("Daily feature coverage mismatch")
+          if daily["trade_date"].nunique() < 150:
+              raise SystemExit("Too few trading days for a one-year acquisition")
+          print(json.dumps(manifest, indent=2))
+          print(f"Compact feature artifact size: {Path(root / 'daily_features.parquet').stat().st_size / 1024 / 1024:.2f} MB")
+          PY
+
+      - name: Upload Stage 3 compact research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage3-batch-${{ inputs.batch_number }}-${{ github.run_number }}
+          path: artifacts/stage3/
+          if-no-files-found: error
+          retention-days: 14

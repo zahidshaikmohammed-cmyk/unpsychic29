@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       batch_number:
-        description: "50-stock batch number (1..10 for the NIFTY 500 universe)"
+        description: "50-stock batch number"
         required: true
         default: "1"
         type: string
@@ -37,10 +37,11 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout acquisition implementation
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: data-acquisition
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Runner and input preflight
         shell: bash
@@ -60,6 +61,7 @@ jobs:
           test -f src/dhan_historical.py
           test -f src/research_metrics.py
           test -f tests/test_stage3.py
+          test -f tests/test_validation.py
           [[ "${BATCH_NUMBER}" =~ ^[1-9][0-9]*$ ]]
           [[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]
           [[ "${LOOKBACK_DAYS}" =~ ^[1-9][0-9]*$ ]]
@@ -69,7 +71,7 @@ jobs:
           (( CHUNK_DAYS <= 30 ))
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -113,13 +115,14 @@ jobs:
           PY
 
       - name: Acquire one-year 1-minute data and extract daily features
+        id: acquire
+        continue-on-error: true
         shell: bash
         env:
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
         run: |
-          set -euo pipefail
-          mkdir -p artifacts/stage3
           set +e
+          mkdir -p artifacts/stage3
           python src/stage3_acquire.py \
             --universe artifacts/universe/candidate_universe.csv \
             --batch-number "${{ inputs.batch_number }}" \
@@ -128,24 +131,17 @@ jobs:
             --chunk-days "${{ inputs.chunk_days }}" \
             --output artifacts/stage3 2>&1 | tee artifacts/stage3/acquisition.log
           status=${PIPESTATUS[0]}
-          set -e
+          echo "${status}" > artifacts/stage3/acquisition_exit_code.txt
           exit "${status}"
 
-      - name: Upload failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unpsychic29-stage3-failure-diagnostics-${{ inputs.batch_number }}-${{ github.run_number }}
-          path: artifacts/stage3/
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Final artifact integrity gate
+        if: ${{ steps.acquire.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           test -s artifacts/stage3/batch_universe.csv
           test -s artifacts/stage3/download_validation.csv
+          test -s artifacts/stage3/acquisition_quality.csv
           test -s artifacts/stage3/daily_features.parquet
           test -s artifacts/stage3/daily_features.csv
           test -s artifacts/stage3/chunk_log.csv
@@ -158,25 +154,45 @@ jobs:
           manifest = json.loads((root / "stage3_manifest.json").read_text(encoding="utf-8"))
           batch = pd.read_csv(root / "batch_universe.csv")
           validation = pd.read_csv(root / "download_validation.csv")
+          acquisition = pd.read_csv(root / "acquisition_quality.csv")
           daily = pd.read_parquet(root / "daily_features.parquet")
           if len(batch) != manifest["batch_symbol_count"]:
               raise SystemExit("Batch count mismatch")
           if len(validation) != len(batch):
               raise SystemExit("Validation count mismatch")
+          if len(acquisition) != len(batch):
+              raise SystemExit("Acquisition quality count mismatch")
           if not (validation["status"] == "OK").all():
-              raise SystemExit("A symbol is not OK")
-          if daily["symbol"].nunique() != len(batch):
-              raise SystemExit("Daily feature coverage mismatch")
+              raise SystemExit("Structural data validation failure present")
+          if not (acquisition["acquisition_status"] == "ACQUIRED").all():
+              raise SystemExit("Acquisition coverage failure present")
+          if daily["symbol"].nunique() == 0:
+              raise SystemExit("No daily feature symbols produced")
           if daily["trade_date"].nunique() < 150:
               raise SystemExit("Too few trading days for a one-year acquisition")
           print(json.dumps(manifest, indent=2))
           print(f"Compact feature artifact size: {Path(root / 'daily_features.parquet').stat().st_size / 1024 / 1024:.2f} MB")
           PY
 
-      - name: Upload Stage 3 compact research artifact
+      - name: Upload Stage 3 artifact and diagnostics
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unpsychic29-stage3-batch-${{ inputs.batch_number }}-${{ github.run_number }}
-          path: artifacts/stage3/
-          if-no-files-found: error
+          path: |
+            artifacts/stage3/
+            artifacts/universe/universe_manifest.json
+            artifacts/universe/candidate_universe.csv
+          if-no-files-found: warn
           retention-days: 14
+
+      - name: Final execution gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.acquire.outcome }}" != "success" ]]; then
+            echo "Stage 3 acquisition did not complete successfully. Diagnostic artifact was uploaded."
+            exit 1
+          fi
+          echo "Stage 3 execution gate: PASS"

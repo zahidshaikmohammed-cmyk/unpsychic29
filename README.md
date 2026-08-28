@@ -27,13 +27,16 @@ Dhan Historical Data API
 GitHub Actions
         |
         v
+Access preflight + deterministic self-test
+        |
+        v
 1-minute OHLCV downloader
         |
         v
-Parquet research dataset
+Validation + Parquet dataset
         |
         v
-Feature + scoring engine
+Feature engine
         |
         v
 Top candidates -> final 29
@@ -46,30 +49,45 @@ No Render service and no Postgres database are required for the batch research w
 
 ## Secrets
 
-GitHub repository secrets used by the workflow:
+The workflow uses one repository secret:
 
-- `DHAN_ACCESS_TOKEN` — required for Dhan Historical Data API calls.
-- `DHAN_CLIENT_ID` — stored for future Dhan integrations; historical candle calls currently authenticate with the access token.
-- `DHAN_PIN` — stored only because it already exists in the repository; the research downloader does not use or print it.
+- `DHAN_ACCESS_TOKEN` — required for Dhan profile and historical-data API calls.
+
+`DHAN_CLIENT_ID` and `DHAN_PIN` may exist in the repository because they were previously added, but this historical downloader does not need or print them.
 
 **Never commit secret values to the repository.**
 
+Dhan documents access tokens as short-lived (24 hours for the current individual-token flow), so a fresh token may be required before a manual run.
+
+## Zero-failure execution gate
+
+Before any historical request is made, the workflow verifies:
+
+1. required repository files exist
+2. Python source compiles
+3. downloader deterministic self-test passes
+4. Dhan access token is present
+5. Dhan profile accepts the token
+6. Dhan Data API plan is active
+
+The downloader then validates the returned datasets for duplicate timestamps, OHLC integrity, session boundaries, and volume completeness. Any failed validation stops the run; no partial research result is accepted as valid.
+
 ## Current phase
 
-Phase 1 is deliberately small: validate Dhan access, retrieve the instrument master, select a tiny test universe, download 1-minute historical candles in manageable date chunks, validate the data, and publish a downloadable artifact.
+Phase 1 is deliberately small: validate Dhan access, retrieve the instrument master, select a tiny test universe, download 1-minute historical candles in manageable date chunks, validate the data, calculate descriptive behaviour metrics, and publish a downloadable artifact.
 
-Only after this passes will the workflow be expanded to the full NSE candidate universe and one-year research run.
+Only after this passes will the workflow be expanded to the broad NSE candidate universe and one-year research run.
 
 ## Data source
 
-DhanHQ v2 Intraday Historical Data provides 1, 5, 15, 25 and 60 minute OHLC/OI/volume data, with intraday history currently available for up to five years. The project uses the 1-minute interval for the research dataset.
+DhanHQ v2 Intraday Historical Data currently provides 1, 5, 15, 25 and 60 minute OHLC/volume data, with intraday history available for up to five years. The project uses the 1-minute interval for the research dataset.
 
 ## Repository layout
 
 ```text
 .github/workflows/       GitHub Actions workflows
 config/                  Research configuration
-src/                     Downloader and validation code
+src/                     Downloader and research engine
 artifacts/               Local output location (ignored by Git)
 ```
 

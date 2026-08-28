@@ -1,0 +1,18 @@
+{
+  "exchange_segment": "NSE_EQ",
+  "instrument": "EQUITY",
+  "interval": "1",
+  "lookback_days": 365,
+  "chunk_days": 20,
+  "timezone": "Asia/Kolkata",
+  "output_format": "parquet",
+  "test_symbols": [
+    "RELIANCE",
+    "HDFCBANK",
+    "ICICIBANK",
+    "INFY",
+    "TCS"
+  ],
+  "test_mode": true,
+  "max_symbols": 5
+}

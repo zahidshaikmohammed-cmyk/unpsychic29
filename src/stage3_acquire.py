@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,22 +12,20 @@ from zoneinfo import ZoneInfo
 
 try:
     from .dhan_historical import (
+        canonical_session_mask,
         check_dhan_access,
         date_chunks,
         fetch_chunk,
-        fetch_instrument_master,
-        resolve_equities,
         require_access_token,
         validate_frame,
     )
     from .research_metrics import daily_features
 except ImportError:
     from dhan_historical import (
+        canonical_session_mask,
         check_dhan_access,
         date_chunks,
         fetch_chunk,
-        fetch_instrument_master,
-        resolve_equities,
         require_access_token,
         validate_frame,
     )
@@ -70,11 +67,35 @@ def select_batch(universe: pd.DataFrame, batch_number: int, batch_size: int) -> 
     return batch
 
 
-def acquire_symbol(session: requests.Session, token: str, symbol: str, security_id: str, start: date, end: date, chunk_days: int) -> tuple[pd.DataFrame, list[dict]]:
+def reconcile_duplicate_timestamps(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    if frame.empty or not frame["timestamp"].duplicated().any():
+        return frame, 0
+    value_columns = ["open", "high", "low", "close", "volume", "security_id"]
+    conflicting: list[str] = []
+    removed = 0
+    for timestamp, group in frame[frame["timestamp"].duplicated(keep=False)].groupby("timestamp", sort=False):
+        if any(group[column].nunique(dropna=False) > 1 for column in value_columns):
+            conflicting.append(str(timestamp))
+        removed += len(group) - 1
+    if conflicting:
+        raise RuntimeError(f"Conflicting duplicate candles detected at {len(conflicting)} timestamps; first={conflicting[:5]}")
+    return frame.drop_duplicates("timestamp", keep="first").sort_values("timestamp").reset_index(drop=True), removed
+
+
+def acquire_symbol(
+    session: requests.Session,
+    token: str,
+    symbol: str,
+    security_id: str,
+    start: date,
+    end: date,
+    chunk_days: int,
+) -> tuple[pd.DataFrame, list[dict], int]:
     parts: list[pd.DataFrame] = []
     chunk_reports: list[dict] = []
     chunks = list(date_chunks(start, end, chunk_days))
     for index, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        print(f"  {symbol}: chunk {index}/{len(chunks)} {chunk_start} -> {chunk_end}")
         frame = fetch_chunk(session, token, security_id, chunk_start, chunk_end, interval="1")
         chunk_reports.append({
             "symbol": symbol,
@@ -92,19 +113,14 @@ def acquire_symbol(session: requests.Session, token: str, symbol: str, security_
     if not parts:
         raise RuntimeError(f"Dhan returned no 1-minute candles for {symbol} in the requested period.")
     raw = pd.concat(parts, ignore_index=True)
-    raw = raw.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
-    return raw, chunk_reports
+    raw, duplicate_rows_removed = reconcile_duplicate_timestamps(raw)
+    return raw, chunk_reports, duplicate_rows_removed
 
 
-def validate_raw_frame(frame: pd.DataFrame, symbol: str) -> dict:
-    temp = Path("/tmp") / f"unpsychic29_{symbol}.parquet"
-    frame.to_parquet(temp, index=False)
-    try:
-        report = validate_frame(temp)
-    finally:
-        temp.unlink(missing_ok=True)
-    report["symbol"] = symbol
-    return report
+def write_temp_frame(frame: pd.DataFrame, symbol: str) -> Path:
+    path = Path("/tmp") / f"unpsychic29_{symbol}.parquet"
+    frame.to_parquet(path, index=False)
+    return path
 
 
 def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: int, chunk_days: int, output_dir: Path) -> None:
@@ -125,40 +141,82 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
     daily_parts: list[pd.DataFrame] = []
     validations: list[dict] = []
     chunks: list[dict] = []
+    acquisition_rows: list[dict] = []
 
     print(f"Stage 3 batch {batch_number}: {len(batch)} symbols; {start} -> {end} (exclusive)")
     print(f"Dhan profile preflight: PASS; client={profile.get('dhanClientId')}; dataPlan={profile.get('dataPlan')}")
 
     for row in batch.itertuples(index=False):
         print(f"\n[{row.symbol}] securityId={row.security_id}")
-        raw, symbol_chunks = acquire_symbol(session, token, row.symbol, row.security_id, start, end, chunk_days)
-        report = validate_raw_frame(raw, row.symbol)
-        validations.append(report)
+        raw, symbol_chunks, duplicate_rows_removed = acquire_symbol(
+            session, token, row.symbol, row.security_id, start, end, chunk_days
+        )
         chunks.extend(symbol_chunks)
+
+        temp = write_temp_frame(raw, row.symbol)
+        try:
+            report = validate_frame(temp)
+        finally:
+            temp.unlink(missing_ok=True)
+
+        report["duplicate_rows_removed_after_chunk_reconciliation"] = duplicate_rows_removed
+        validations.append(report)
         if report["status"] != "OK":
-            raise RuntimeError(f"Strict 1-minute validation failed for {row.symbol}: {report}")
-        features = daily_features(raw)
-        if features.empty:
-            raise RuntimeError(f"No daily behavioural features produced for {row.symbol}.")
-        features["batch_number"] = batch_number
-        daily_parts.append(features)
-        print(f"{row.symbol}: PASS | {report['rows']} candles | {report['trading_days']} trading days")
+            # Structural corruption is a hard failure. Market-session warnings are not.
+            raise RuntimeError(f"Structural data validation failed for {row.symbol}: {json.dumps(report, default=str)}")
+
+        session_mask = canonical_session_mask(raw["timestamp"])
+        clean = raw.loc[session_mask].copy()
+        clean = clean.sort_values("timestamp").reset_index(drop=True)
+        features = daily_features(clean)
+        feature_days = int(features["trade_date"].nunique()) if not features.empty else 0
+        acquisition_rows.append({
+            "symbol": row.symbol,
+            "security_id": str(row.security_id),
+            "acquisition_status": "ACQUIRED",
+            "structural_validation": report["status"],
+            "raw_rows": int(report["rows"]),
+            "session_rows": int(report["rows_after_session_filter"]),
+            "trading_days": int(report["trading_days"]),
+            "bar_coverage_pct": float(report["bar_coverage_pct"]),
+            "out_of_session_rows_quarantined": int(report["out_of_session_rows"]),
+            "duplicate_rows_removed": int(duplicate_rows_removed),
+            "max_intraday_gap_minutes": float(report["max_intraday_gap_minutes"]),
+            "feature_days_with_complete_opening10": feature_days,
+            "feature_status": "AVAILABLE" if feature_days else "NO_COMPLETE_OPENING_DAYS",
+            "warning_reasons": ";".join(report.get("warning_reasons", [])),
+        })
+        if not features.empty:
+            features["batch_number"] = batch_number
+            daily_parts.append(features)
+        print(
+            f"{row.symbol}: PASS | {report['rows']} raw candles | {report['trading_days']} trading days | "
+            f"{report['bar_coverage_pct']:.2f}% regular-session coverage | {feature_days} feature days"
+        )
 
     validation = pd.DataFrame(validations).sort_values("symbol")
-    daily = pd.concat(daily_parts, ignore_index=True).sort_values(["symbol", "trade_date"])
+    acquisition = pd.DataFrame(acquisition_rows).sort_values("symbol")
     chunk_log = pd.DataFrame(chunks)
+    if daily_parts:
+        daily = pd.concat(daily_parts, ignore_index=True).sort_values(["symbol", "trade_date"])
+    else:
+        daily = pd.DataFrame()
 
     if len(validation) != len(batch):
         raise RuntimeError("Validation row count does not equal batch size.")
+    if len(acquisition) != len(batch) or acquisition["acquisition_status"].ne("ACQUIRED").any():
+        raise RuntimeError("Acquisition coverage does not equal the requested batch.")
     if (validation["status"] != "OK").any():
-        raise RuntimeError("One or more symbols failed strict validation.")
-    if daily["symbol"].nunique() != len(batch):
-        raise RuntimeError("Daily feature output does not cover every batch symbol.")
+        raise RuntimeError("One or more symbols has structural data-quality failures.")
 
     batch.to_csv(output_dir / "batch_universe.csv", index=False)
     validation.to_csv(output_dir / "download_validation.csv", index=False)
-    daily.to_parquet(output_dir / "daily_features.parquet", index=False)
-    daily.to_csv(output_dir / "daily_features.csv", index=False)
+    acquisition.to_csv(output_dir / "acquisition_quality.csv", index=False)
+    if not daily.empty:
+        daily.to_parquet(output_dir / "daily_features.parquet", index=False)
+        daily.to_csv(output_dir / "daily_features.csv", index=False)
+    else:
+        raise RuntimeError("No daily behavioural features were produced for the entire batch.")
     chunk_log.to_csv(output_dir / "chunk_log.csv", index=False)
 
     manifest = {
@@ -176,10 +234,13 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
         "chunk_days": chunk_days,
         "raw_1min_data_persisted": False,
         "raw_1min_data_processed_in_memory": True,
-        "reason_raw_not_persisted": "GitHub Free Actions artifact storage is 500 MB; Stage 3 preserves compact daily features and validation, while raw 1-minute data can be reacquired for finalists in later stages.",
-        "all_symbols_validated": True,
+        "raw_1min_data_storage_policy": "Raw minute data is processed in memory; compact quality and daily-feature artifacts are persisted. Full minute data will be reacquired for finalists.",
+        "all_symbols_acquired": True,
         "validated_symbol_count": len(validation),
+        "symbols_with_session_warnings": int((acquisition["warning_reasons"] != "").sum()),
+        "symbols_with_complete_opening10_features": int((acquisition["feature_status"] == "AVAILABLE").sum()),
         "total_1min_rows_processed": int(validation["rows"].sum()),
+        "total_regular_session_rows": int(validation["rows_after_session_filter"].sum()),
         "total_daily_feature_rows": int(len(daily)),
     }
     (output_dir / "stage3_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -190,12 +251,17 @@ def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: 
 
 def self_test() -> None:
     sample = pd.DataFrame({
-        "symbol": ["AAA", "BBB", "CCC"],
-        "security_id": ["1", "2", "3"],
-        "exchange_segment": ["NSE_EQ"] * 3,
-        "instrument": ["EQUITY"] * 3,
+        "timestamp": pd.to_datetime(["2026-01-02 09:15:00", "2026-01-02 09:15:00", "2026-01-02 09:16:00"], utc=True),
+        "open": [100.0, 100.0, 101.0],
+        "high": [101.0, 101.0, 102.0],
+        "low": [99.0, 99.0, 100.0],
+        "close": [100.5, 100.5, 101.5],
+        "volume": [1000, 1000, 1100],
+        "security_id": ["1", "1", "1"],
     })
-    selected = select_batch(sample, 2, 2)
+    clean, removed = reconcile_duplicate_timestamps(sample)
+    assert len(clean) == 2 and removed == 1
+    selected = select_batch(pd.DataFrame({"symbol": ["AAA", "BBB", "CCC"], "security_id": ["1", "2", "3"], "exchange_segment": ["NSE_EQ"] * 3, "instrument": ["EQUITY"] * 3}), 2, 2)
     assert selected["symbol"].tolist() == ["CCC"]
     print("Stage 3 self-test: PASS")
 

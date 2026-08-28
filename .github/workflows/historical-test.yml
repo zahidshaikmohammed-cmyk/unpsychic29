@@ -1,0 +1,83 @@
+name: UNPSYCHIC29 Historical Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Historical lookback days for this run"
+        required: true
+        default: "30"
+        type: string
+      max_symbols:
+        description: "Maximum test symbols"
+        required: true
+        default: "5"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  historical-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Dhan historical candles
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_PIN: ${{ secrets.DHAN_PIN }}
+        run: |
+          python src/dhan_historical.py \
+            --config config/research.json \
+            --days "${{ inputs.days }}" \
+            --max-symbols "${{ inputs.max_symbols }}"
+
+      - name: Calculate initial behaviour metrics
+        run: python src/research_metrics.py --input artifacts/raw_1min --output artifacts/research
+
+      - name: Write run manifest
+        env:
+          LOOKBACK_DAYS: ${{ inputs.days }}
+          MAX_SYMBOLS: ${{ inputs.max_symbols }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          manifest = {
+              "project": "UNPSYCHIC29",
+              "purpose": "Dhan historical intraday research test",
+              "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+              "git_sha": os.environ["GITHUB_SHA"],
+              "lookback_days": int(os.environ["LOOKBACK_DAYS"]),
+              "max_symbols": int(os.environ["MAX_SYMBOLS"]),
+              "interval_minutes": 1,
+              "exchange_segment": "NSE_EQ",
+              "instrument": "EQUITY",
+          }
+          Path("artifacts/run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          PY
+
+      - name: Upload research artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-historical-test-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

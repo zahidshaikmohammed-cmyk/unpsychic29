@@ -19,6 +19,7 @@ INSTRUMENT_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
+MAX_OUT_OF_SESSION_RATE_PCT = 0.50
 
 
 def require_access_token() -> str:
@@ -201,6 +202,7 @@ def validate_frame(path: Path) -> dict:
     non_minute_aligned = int(((timestamps.dt.second != 0) | (timestamps.dt.microsecond != 0)).sum())
     in_session = canonical_session_mask(timestamps)
     out_of_session = int((~in_session).sum())
+    out_of_session_rate_pct = float(out_of_session / len(frame) * 100.0)
     bad_ohlc_mask = (numeric <= 0).any(axis=1)
     invalid_high_mask = frame["high"] < numeric[["open", "close", "low"]].max(axis=1)
     invalid_low_mask = frame["low"] > numeric[["open", "close", "high"]].min(axis=1)
@@ -221,7 +223,9 @@ def validate_frame(path: Path) -> dict:
         failures.append("negative_volume")
     if non_minute_aligned:
         failures.append("non_minute_aligned_timestamps")
-    if out_of_session:
+    if out_of_session_rate_pct > MAX_OUT_OF_SESSION_RATE_PCT:
+        failures.append("excessive_out_of_session_rows")
+    elif out_of_session:
         warnings.append("out_of_session_rows_quarantined")
     clean = frame.loc[in_session].copy()
     clean_ts = timestamps.loc[in_session]
@@ -242,7 +246,8 @@ def validate_frame(path: Path) -> dict:
         "duplicate_timestamps": duplicate_count, "bad_ohlc_rows": bad_ohlc, "invalid_high_rows": invalid_high,
         "invalid_low_rows": invalid_low, "null_volume_rows": null_volume, "negative_volume_rows": negative_volume,
         "non_minute_aligned_timestamps": non_minute_aligned, "out_of_session_rows": out_of_session,
-        "max_intraday_gap_minutes": max_intraday_gap_minutes, "failure_reasons": failures, "warning_reasons": warnings,
+        "out_of_session_rate_pct": out_of_session_rate_pct, "max_intraday_gap_minutes": max_intraday_gap_minutes,
+        "failure_reasons": failures, "warning_reasons": warnings,
         "out_of_session_samples": timestamps.loc[~in_session].head(10).astype(str).tolist(),
         "bad_ohlc_samples": frame.loc[bad_ohlc_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),
         "invalid_high_samples": frame.loc[invalid_high_mask, ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records"),

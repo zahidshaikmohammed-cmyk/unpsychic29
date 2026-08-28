@@ -21,16 +21,13 @@ The final 29 are **discovered from data**. They are not hard-coded in advance.
 ## Architecture
 
 ```text
-Dhan Historical Data API
+NSE NIFTY 500 constituent universe
         |
         v
-GitHub Actions
+Dhan instrument master -> Security IDs
         |
         v
-Access preflight + deterministic self-test
-        |
-        v
-1-minute OHLCV downloader
+1-minute historical acquisition
         |
         v
 Validation + Parquet dataset
@@ -39,7 +36,10 @@ Validation + Parquet dataset
 Feature engine
         |
         v
-Top candidates -> final 29
+Elimination -> ranking -> out-of-sample validation
+        |
+        v
+Final UNPSYCHIC29
         |
         v
 GitHub Actions artifact
@@ -47,50 +47,27 @@ GitHub Actions artifact
 
 No Render service and no Postgres database are required for the batch research workflow.
 
+## Stages
+
+1. Infrastructure validation — **PASS**
+2. Candidate universe construction — **CURRENT**
+3. One-year 1-minute acquisition
+4. Behavioural fingerprinting
+5. Hard elimination
+6. Ranking/deep candidate pool
+7. Out-of-sample validation
+8. Final UNPSYCHIC29
+
+## Stage 2
+
+Stage 2 uses the current NSE NIFTY 500 constituent CSV as the broad candidate starting universe. It then resolves every constituent against Dhan's public instrument master and requires a one-to-one `NSE_EQ` / `EQUITY` Security ID mapping.
+
+NIFTY 500 membership is **not** treated as proof of intraday liquidity or predictability. Stage 3 measures actual intraday behaviour from Dhan's 1-minute data.
+
+The Stage 2 gate rejects the run if the source cannot be parsed, the constituent count is implausible, any symbol cannot be resolved, or symbols/security IDs are duplicated.
+
 ## Secrets
 
-The workflow uses one repository secret:
+Historical acquisition uses `DHAN_ACCESS_TOKEN`. Stage 2 does not require a Dhan authentication secret.
 
-- `DHAN_ACCESS_TOKEN` — required for Dhan profile and historical-data API calls.
-
-`DHAN_CLIENT_ID` and `DHAN_PIN` may exist in the repository because they were previously added, but this historical downloader does not need or print them.
-
-**Never commit secret values to the repository.**
-
-Dhan documents access tokens as short-lived (24 hours for the current individual-token flow), so a fresh token may be required before a manual run.
-
-## Zero-failure execution gate
-
-Before any historical request is made, the workflow verifies:
-
-1. required repository files exist
-2. Python source compiles
-3. downloader deterministic self-test passes
-4. Dhan access token is present
-5. Dhan profile accepts the token
-6. Dhan Data API plan is active
-
-The downloader then validates the returned datasets for duplicate timestamps, OHLC integrity, session boundaries, and volume completeness. Any failed validation stops the run; no partial research result is accepted as valid.
-
-## Current phase
-
-Phase 1 is deliberately small: validate Dhan access, retrieve the instrument master, select a tiny test universe, download 1-minute historical candles in manageable date chunks, validate the data, calculate descriptive behaviour metrics, and publish a downloadable artifact.
-
-Only after this passes will the workflow be expanded to the broad NSE candidate universe and one-year research run.
-
-## Data source
-
-DhanHQ v2 Intraday Historical Data currently provides 1, 5, 15, 25 and 60 minute OHLC/volume data, with intraday history available for up to five years. The project uses the 1-minute interval for the research dataset.
-
-## Repository layout
-
-```text
-.github/workflows/       GitHub Actions workflows
-config/                  Research configuration
-src/                     Downloader and research engine
-artifacts/               Local output location (ignored by Git)
-```
-
-## Important research principle
-
-The engine is designed to avoid selecting stocks merely because they move a lot. The target behaviour is controlled, liquid, repeatable expansion with relatively low opening chaos and lower immediate-reversal frequency.
+Never commit secret values to the repository.

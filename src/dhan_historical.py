@@ -29,11 +29,7 @@ def require_access_token() -> str:
 
 
 def check_dhan_access(session: requests.Session, access_token: str) -> dict:
-    response = session.get(
-        DHAN_PROFILE_URL,
-        headers={"Accept": "application/json", "access-token": access_token},
-        timeout=30,
-    )
+    response = session.get(DHAN_PROFILE_URL, headers={"Accept": "application/json", "access-token": access_token}, timeout=30)
     try:
         body = response.json()
     except ValueError as exc:
@@ -66,7 +62,6 @@ def resolve_equities(master: pd.DataFrame, symbols: Iterable[str]) -> pd.DataFra
     missing = required.difference(master.columns)
     if missing:
         raise RuntimeError(f"Dhan instrument master is missing columns: {sorted(missing)}")
-
     symbols = [s.strip().upper() for s in symbols if s.strip()]
     if not symbols:
         raise RuntimeError("No symbols were supplied.")
@@ -195,19 +190,39 @@ def validate_frame(path: Path) -> dict:
     null_volume = int(frame["volume"].isna().sum())
     in_session = (timestamps.dt.time >= pd.Timestamp(MARKET_OPEN).time()) & (timestamps.dt.time <= pd.Timestamp(MARKET_CLOSE).time())
     out_of_session = int((~in_session).sum())
+    out_of_session_samples = timestamps.loc[~in_session].head(10).astype(str).tolist()
+    bad_ohlc_samples = frame.loc[(frame[["open", "high", "low", "close"]] <= 0).any(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    invalid_high_samples = frame.loc[frame["high"] < frame[["open", "close", "low"]].max(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    invalid_low_samples = frame.loc[frame["low"] > frame[["open", "close", "high"]].min(axis=1), ["timestamp", "open", "high", "low", "close"]].head(5).to_dict("records")
+    null_volume_samples = frame.loc[frame["volume"].isna(), ["timestamp", "volume"]].head(5).to_dict("records")
     by_day = frame.assign(_ts=timestamps).sort_values("_ts").groupby(timestamps.dt.date)
     max_intraday_gap_minutes = 0.0
     for _, day in by_day:
         diffs = day["_ts"].diff().dt.total_seconds().div(60).dropna()
         if not diffs.empty:
             max_intraday_gap_minutes = max(max_intraday_gap_minutes, float(diffs.max()))
-    checks = [duplicate_count == 0, bad_ohlc == 0, invalid_high == 0, invalid_low == 0, out_of_session == 0, null_volume == 0]
+    failures = []
+    if duplicate_count:
+        failures.append("duplicate_timestamps")
+    if bad_ohlc:
+        failures.append("non_positive_ohlc")
+    if invalid_high:
+        failures.append("invalid_high")
+    if invalid_low:
+        failures.append("invalid_low")
+    if null_volume:
+        failures.append("null_volume")
+    if out_of_session:
+        failures.append("out_of_session")
     return {
         "symbol": path.stem, "rows": int(len(frame)), "first_timestamp": str(timestamps.min()), "last_timestamp": str(timestamps.max()),
         "trading_days": int(timestamps.dt.date.nunique()), "duplicate_timestamps": duplicate_count, "bad_ohlc_rows": bad_ohlc,
-        "invalid_high_rows": invalid_high, "invalid_low_rows": invalid_low, "null_volume_rows": null_volume,
+        "invalid_high_rows": invalid_high, "invalid_low_rows": invalid_low, "null_volume_rows": null_volume_rows if False else null_volume,
         "out_of_session_rows": out_of_session, "max_intraday_gap_minutes": max_intraday_gap_minutes,
-        "status": "OK" if all(checks) else "CHECK",
+        "failure_reasons": failures, "out_of_session_samples": out_of_session_samples,
+        "bad_ohlc_samples": bad_ohlc_samples, "invalid_high_samples": invalid_high_samples,
+        "invalid_low_samples": invalid_low_samples, "null_volume_samples": null_volume_samples,
+        "status": "OK" if not failures else "CHECK",
     }
 
 
@@ -267,7 +282,7 @@ def main() -> None:
         path = download_symbol(session, access_token, row.symbol, row.security_id, start, end, chunk_days, output_dir)
         report = validate_frame(path)
         reports.append(report)
-        print(f"  {row.symbol}: {report['status']} ({report['rows']} rows)")
+        print(f"  {row.symbol}: {report['status']} ({report['rows']} rows) failures={report.get('failure_reasons', [])}")
     validation = pd.DataFrame(reports)
     validation.to_csv("artifacts/download_validation.csv", index=False)
     if len(validation) != len(resolved) or (validation["status"] != "OK").any():

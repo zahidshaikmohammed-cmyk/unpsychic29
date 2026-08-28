@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from src.dhan_historical import date_chunks, response_to_frame
+import pandas as pd
+
+from src.dhan_historical import canonical_session_mask, date_chunks, response_to_frame
 
 
 class DhanHistoricalTests(unittest.TestCase):
@@ -38,6 +40,15 @@ class DhanHistoricalTests(unittest.TestCase):
         }
         with self.assertRaises(RuntimeError):
             response_to_frame(body, "123")
+
+    def test_regular_session_is_0915_inclusive_and_1530_exclusive(self) -> None:
+        ts = pd.to_datetime([
+            "2026-08-28 09:14:00+05:30",
+            "2026-08-28 09:15:00+05:30",
+            "2026-08-28 15:29:00+05:30",
+            "2026-08-28 15:30:00+05:30",
+        ], utc=True)
+        self.assertEqual(canonical_session_mask(ts).tolist(), [False, True, True, False])
 
 
 if __name__ == "__main__":

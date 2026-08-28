@@ -11,16 +11,28 @@ import pandas as pd
 import requests
 from zoneinfo import ZoneInfo
 
-from dhan_historical import (
-    check_dhan_access,
-    date_chunks,
-    fetch_chunk,
-    fetch_instrument_master,
-    resolve_equities,
-    require_access_token,
-    validate_frame,
-)
-from research_metrics import daily_features
+try:
+    from .dhan_historical import (
+        check_dhan_access,
+        date_chunks,
+        fetch_chunk,
+        fetch_instrument_master,
+        resolve_equities,
+        require_access_token,
+        validate_frame,
+    )
+    from .research_metrics import daily_features
+except ImportError:
+    from dhan_historical import (
+        check_dhan_access,
+        date_chunks,
+        fetch_chunk,
+        fetch_instrument_master,
+        resolve_equities,
+        require_access_token,
+        validate_frame,
+    )
+    from research_metrics import daily_features
 
 IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_CHUNK_DAYS = 30
@@ -58,15 +70,7 @@ def select_batch(universe: pd.DataFrame, batch_number: int, batch_size: int) -> 
     return batch
 
 
-def acquire_symbol(
-    session: requests.Session,
-    token: str,
-    symbol: str,
-    security_id: str,
-    start: date,
-    end: date,
-    chunk_days: int,
-) -> tuple[pd.DataFrame, list[dict]]:
+def acquire_symbol(session: requests.Session, token: str, symbol: str, security_id: str, start: date, end: date, chunk_days: int) -> tuple[pd.DataFrame, list[dict]]:
     parts: list[pd.DataFrame] = []
     chunk_reports: list[dict] = []
     chunks = list(date_chunks(start, end, chunk_days))
@@ -84,7 +88,6 @@ def acquire_symbol(
         if not frame.empty:
             frame.insert(0, "symbol", symbol)
             parts.append(frame)
-        # Stay comfortably below Dhan's documented Data API request rate.
         time.sleep(0.30)
     if not parts:
         raise RuntimeError(f"Dhan returned no 1-minute candles for {symbol} in the requested period.")
@@ -104,14 +107,7 @@ def validate_raw_frame(frame: pd.DataFrame, symbol: str) -> dict:
     return report
 
 
-def run(
-    universe_path: Path,
-    batch_number: int,
-    batch_size: int,
-    lookback_days: int,
-    chunk_days: int,
-    output_dir: Path,
-) -> None:
+def run(universe_path: Path, batch_number: int, batch_size: int, lookback_days: int, chunk_days: int, output_dir: Path) -> None:
     if lookback_days < 300:
         raise RuntimeError("Stage 3 requires at least 300 calendar days; use ~365 for the production run.")
     token = require_access_token()
@@ -135,21 +131,12 @@ def run(
 
     for row in batch.itertuples(index=False):
         print(f"\n[{row.symbol}] securityId={row.security_id}")
-        raw, symbol_chunks = acquire_symbol(
-            session,
-            token,
-            row.symbol,
-            row.security_id,
-            start,
-            end,
-            chunk_days,
-        )
+        raw, symbol_chunks = acquire_symbol(session, token, row.symbol, row.security_id, start, end, chunk_days)
         report = validate_raw_frame(raw, row.symbol)
         validations.append(report)
         chunks.extend(symbol_chunks)
         if report["status"] != "OK":
             raise RuntimeError(f"Strict 1-minute validation failed for {row.symbol}: {report}")
-
         features = daily_features(raw)
         if features.empty:
             raise RuntimeError(f"No daily behavioural features produced for {row.symbol}.")
@@ -202,14 +189,12 @@ def run(
 
 
 def self_test() -> None:
-    sample = pd.DataFrame(
-        {
-            "symbol": ["AAA", "BBB", "CCC"],
-            "security_id": ["1", "2", "3"],
-            "exchange_segment": ["NSE_EQ"] * 3,
-            "instrument": ["EQUITY"] * 3,
-        }
-    )
+    sample = pd.DataFrame({
+        "symbol": ["AAA", "BBB", "CCC"],
+        "security_id": ["1", "2", "3"],
+        "exchange_segment": ["NSE_EQ"] * 3,
+        "instrument": ["EQUITY"] * 3,
+    })
     selected = select_batch(sample, 2, 2)
     assert selected["symbol"].tolist() == ["CCC"]
     print("Stage 3 self-test: PASS")

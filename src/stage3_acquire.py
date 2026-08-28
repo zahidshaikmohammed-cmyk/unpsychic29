@@ -72,10 +72,11 @@ def quarantine_provider_ohlc_anomalies(frame: pd.DataFrame, limit: int = MAX_PRO
         (ohlc <= 0).any(axis=1)
         | (frame["high"] < ohlc[["open", "close", "low"]].max(axis=1))
         | (frame["low"] > ohlc[["open", "close", "high"]].min(axis=1))
+        | (frame["volume"] < 0)
     )
     count = int(bad.sum())
     if count > limit:
-        raise RuntimeError(f"Provider returned {count} invalid OHLC candles; refusing to quarantine systemic corruption.")
+        raise RuntimeError(f"Provider returned {count} invalid OHLC/volume candles; refusing to quarantine systemic corruption.")
     if count == 0:
         return frame, 0, []
     timestamps = frame.loc[bad, "timestamp"].astype(str).tolist()
@@ -195,6 +196,9 @@ def self_test() -> None:
     bad = clean.copy(); bad.loc[0, "high"] = 98.0
     repaired, count, _ = quarantine_provider_ohlc_anomalies(bad)
     assert len(repaired) == 1 and count == 1
+    bad_volume = clean.copy(); bad_volume.loc[0, "volume"] = -10
+    repaired_volume, count_volume, _ = quarantine_provider_ohlc_anomalies(bad_volume)
+    assert len(repaired_volume) == 1 and count_volume == 1
     selected = select_batch(pd.DataFrame({"symbol": ["AAA", "BBB", "CCC"], "security_id": ["1", "2", "3"], "exchange_segment": ["NSE_EQ"] * 3, "instrument": ["EQUITY"] * 3}), 2, 2)
     assert selected["symbol"].tolist() == ["CCC"]
     print("Stage 3 self-test: PASS")

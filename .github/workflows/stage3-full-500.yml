@@ -1,0 +1,214 @@
+name: UNPSYCHIC29 Stage 3 - FULL 500 Acquisition
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    name: Batch ${{ matrix.batch }}/10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      max-parallel: 5
+      matrix:
+        batch: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - name: Checkout acquisition implementation
+        uses: actions/checkout@v6
+        with:
+          ref: data-acquisition
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Deterministic preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q src tests
+          python -m unittest discover -s tests -v
+          python src/dhan_historical.py --self-test
+          python src/stage3_acquire.py --self-test
+
+      - name: Build and verify NIFTY 500 universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python src/build_universe.py --output artifacts/universe
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/universe")
+          manifest = json.loads((root / "universe_manifest.json").read_text())
+          universe = pd.read_csv(root / "candidate_universe.csv")
+          if manifest["constituent_count"] != 500 or manifest["resolved_count"] != 500 or len(universe) != 500:
+              raise SystemExit(f"Expected exactly 500 resolved constituents; got manifest={manifest}, rows={len(universe)}")
+          if not universe["symbol"].is_unique or not universe["security_id"].is_unique:
+              raise SystemExit("Universe contains duplicate symbols or security IDs")
+          print(f"Verified NIFTY 500 universe: {len(universe)} stocks")
+          PY
+
+      - name: Acquire 365 days of 1-minute data
+        env:
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/stage3
+          python src/stage3_acquire.py \
+            --universe artifacts/universe/candidate_universe.csv \
+            --batch-number "${{ matrix.batch }}" \
+            --batch-size 50 \
+            --lookback-days 365 \
+            --chunk-days 30 \
+            --output artifacts/stage3 2>&1 | tee artifacts/stage3/acquisition.log
+
+      - name: Verify batch artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s artifacts/stage3/batch_universe.csv
+          test -s artifacts/stage3/download_validation.csv
+          test -s artifacts/stage3/acquisition_quality.csv
+          test -s artifacts/stage3/daily_features.parquet
+          test -s artifacts/stage3/daily_features.csv
+          test -s artifacts/stage3/chunk_log.csv
+          test -s artifacts/stage3/stage3_manifest.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          root = Path("artifacts/stage3")
+          manifest = json.loads((root / "stage3_manifest.json").read_text())
+          batch = pd.read_csv(root / "batch_universe.csv")
+          validation = pd.read_csv(root / "download_validation.csv")
+          acquisition = pd.read_csv(root / "acquisition_quality.csv")
+          daily = pd.read_parquet(root / "daily_features.parquet")
+          assert len(batch) == 50, f"Batch size is {len(batch)}, expected 50"
+          assert len(validation) == 50 and (validation["status"] == "OK").all()
+          assert len(acquisition) == 50 and (acquisition["acquisition_status"] == "ACQUIRED").all()
+          assert daily["symbol"].nunique() == 50
+          assert daily["trade_date"].nunique() >= 150
+          assert manifest["batch_symbol_count"] == 50
+          print(f"Batch {manifest['batch_number']}: PASS | 50/50 stocks | {len(daily)} daily feature rows")
+          PY
+
+      - name: Upload validated batch
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage3-full-batch-${{ matrix.batch }}
+          path: artifacts/stage3/
+          retention-days: 14
+
+  combine:
+    name: Combine 10 validated batches
+    needs: acquire
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download all validated batches
+        uses: actions/download-artifact@v5
+        with:
+          pattern: unpsychic29-stage3-full-batch-*
+          path: artifacts/batches
+
+      - name: Combine and verify 500-stock research dataset
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          import pandas as pd
+
+          root = Path("artifacts/batches")
+          dirs = sorted(p for p in root.iterdir() if p.is_dir())
+          if len(dirs) != 10:
+              raise SystemExit(f"Expected 10 batch artifacts, found {len(dirs)}")
+
+          batches = []
+          validations = []
+          acquisitions = []
+          daily_parts = []
+          seen = set()
+
+          for directory in dirs:
+              batch = pd.read_csv(directory / "batch_universe.csv")
+              validation = pd.read_csv(directory / "download_validation.csv")
+              acquisition = pd.read_csv(directory / "acquisition_quality.csv")
+              daily = pd.read_parquet(directory / "daily_features.parquet")
+              if len(batch) != 50:
+                  raise SystemExit(f"{directory.name}: expected 50 stocks, got {len(batch)}")
+              if not (validation["status"] == "OK").all():
+                  raise SystemExit(f"{directory.name}: validation failure")
+              if not (acquisition["acquisition_status"] == "ACQUIRED").all():
+                  raise SystemExit(f"{directory.name}: acquisition failure")
+              overlap = seen.intersection(set(batch["symbol"]))
+              if overlap:
+                  raise SystemExit(f"Duplicate symbols across batches: {sorted(overlap)}")
+              seen.update(batch["symbol"])
+              batches.append(batch)
+              validations.append(validation)
+              acquisitions.append(acquisition)
+              daily_parts.append(daily)
+
+          universe = pd.concat(batches, ignore_index=True)
+          validation = pd.concat(validations, ignore_index=True)
+          acquisition = pd.concat(acquisitions, ignore_index=True)
+          daily = pd.concat(daily_parts, ignore_index=True)
+
+          if len(universe) != 500 or universe["symbol"].nunique() != 500:
+              raise SystemExit(f"Combined universe is not exactly 500 unique stocks: {len(universe)}")
+          if validation["symbol"].nunique() != 500 or not (validation["status"] == "OK").all():
+              raise SystemExit("Combined validation gate failed")
+          if acquisition["symbol"].nunique() != 500 or not (acquisition["acquisition_status"] == "ACQUIRED").all():
+              raise SystemExit("Combined acquisition gate failed")
+          if daily["symbol"].nunique() != 500:
+              raise SystemExit(f"Combined daily features contain {daily['symbol'].nunique()} symbols")
+          if daily["trade_date"].nunique() < 150:
+              raise SystemExit("Combined dataset has too few trading days")
+
+          out = Path("artifacts/full500")
+          out.mkdir(parents=True, exist_ok=True)
+          universe.to_csv(out / "candidate_universe_500.csv", index=False)
+          validation.to_csv(out / "download_validation_500.csv", index=False)
+          acquisition.to_csv(out / "acquisition_quality_500.csv", index=False)
+          daily.to_csv(out / "daily_features_500.csv", index=False)
+          daily.to_parquet(out / "daily_features_500.parquet", index=False)
+          manifest = {
+              "status": "OK",
+              "stock_count": 500,
+              "batch_count": 10,
+              "batch_size": 50,
+              "lookback_days": 365,
+              "interval_minutes": 1,
+              "daily_feature_rows": len(daily),
+              "trading_days": int(daily["trade_date"].nunique()),
+          }
+          (out / "full500_manifest.json").write_text(json.dumps(manifest, indent=2))
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload complete 500-stock dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpsychic29-stage3-FULL500
+          path: artifacts/full500/
+          retention-days: 14
